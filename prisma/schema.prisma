@@ -169,3 +169,23 @@ model VerificationReport {
   @@index([step, status])
   @@index([taskRunId])
 }
+
+// RSS feed sources for trend crawling.
+// Can be managed per account or globally. If accountId is null, it's a global source.
+model RssSource {
+  id          String   @id @default(cuid())
+  accountId   String?  // null means global source
+  name        String   // Display name (e.g., "36Kr")
+  url         String   // RSS feed URL
+  category    String   @default("tech") // Category: tech, business, ai, dev, startup, etc.
+  isEnabled   Boolean  @default(true)
+  priority    Int      @default(0) // Higher priority sources are crawled first
+  lastFetched DateTime?
+  itemCount   Int      @default(0) // Number of items fetched in last crawl
+  error       String?  // Last error message if fetch failed
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([accountId, isEnabled])
+  @@index([category, isEnabled])
+}

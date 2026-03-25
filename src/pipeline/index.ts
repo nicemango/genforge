@@ -19,6 +19,7 @@ import type { TaskType } from "@prisma/client";
 import { PipelineCoordinator } from "@/skills/coordinator/pipeline-coordinator";
 import { workspaceManager, type AgentType } from "@/lib/workspace";
 import { uploadImage } from "@/lib/wechat";
+import { notifyTaskRunFailure, notifyPipelineComplete } from "@/lib/notifications";
 
 /**
  * Safely parse a JSON string field from Account.
@@ -869,6 +870,15 @@ async function executeStep(
         if (firstSuccessfulResult) {
           if (workspaceId) {
             await workspaceManager.setStatus(workspaceId, "completed")
+            // Send completion notification with success/failure counts
+            await notifyPipelineComplete(
+              workspaceId,
+              topicIds.length,
+              firstSuccessfulResult ? 1 : 0,
+              failedTopics.length,
+            ).catch((notifyErr) => {
+              console.error(`[FULL_PIPELINE] Failed to send notification: ${notifyErr instanceof Error ? notifyErr.message : String(notifyErr)}`)
+            })
           }
           return {
             topicId: firstSuccessfulResult.topicId,
@@ -881,6 +891,15 @@ async function executeStep(
         // All topics failed
         if (workspaceId) {
           await workspaceManager.setStatus(workspaceId, "failed")
+          // Send failure notification for all topics failed
+          await notifyPipelineComplete(
+            workspaceId,
+            topicIds.length,
+            0,
+            topicIds.length,
+          ).catch((notifyErr) => {
+            console.error(`[FULL_PIPELINE] Failed to send notification: ${notifyErr instanceof Error ? notifyErr.message : String(notifyErr)}`)
+          })
         }
         return {
           taskRunId: currentTaskRunId ?? "",
@@ -891,6 +910,16 @@ async function executeStep(
       } catch (err) {
         if (workspaceId) {
           await workspaceManager.setStatus(workspaceId, "failed")
+          // Send failure notification
+          const errorMessage = err instanceof Error ? err.message : String(err)
+          await notifyTaskRunFailure(
+            currentTaskRunId ?? workspaceId,
+            "FULL_PIPELINE",
+            input.accountId,
+            errorMessage,
+          ).catch((notifyErr) => {
+            console.error(`[FULL_PIPELINE] Failed to send notification: ${notifyErr instanceof Error ? notifyErr.message : String(notifyErr)}`)
+          })
         }
         throw err
       }
