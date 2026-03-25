@@ -1,0 +1,14 @@
+{
+  "model": {
+    "provider": "openai",
+    "model": "Kimi-K2.5",
+    "apiKey": "470165fc-9617-4d34-a1c2-3a453b1cb8f2",
+    "baseURL": "https://ark.cn-beijing.volces.com/api/coding/v1"
+  },
+  "agent": {
+    "temperature": 0.3,
+    "maxTokens": 6000,
+    "count": 5,
+    "maxInputItems": 60
+  }
+}

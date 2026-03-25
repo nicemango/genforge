@@ -1,0 +1,171 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model Account {
+  id           String   @id @default(cuid())
+  name         String
+  isActive     Boolean  @default(true)
+  modelConfig  String   @default("{}")
+  writingStyle String   @default("{}")
+  wechatConfig String   @default("{}")
+  qualityConfig String @default("{\"minScore\":7.0,\"maxWriteRetries\":2}") // {minScore, maxWriteRetries}
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  contents  Content[]
+  topics    Topic[]
+  taskRuns  TaskRun[]
+  schedules ScheduledTask[]
+  qualityRecords QualityRecord[]
+}
+
+model Topic {
+  id        String      @id @default(cuid())
+  accountId String
+  account   Account     @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  title     String
+  angle     String      @default("")
+  summary   String      @default("")
+  sources   String      @default("[]")
+  heatScore Float       @default(0)
+  tags      String      @default("[]")
+  status    TopicStatus @default(PENDING)
+  createdAt DateTime    @default(now())
+  updatedAt DateTime    @updatedAt
+
+  contents Content[]
+
+  @@index([accountId, status])
+}
+
+enum TopicStatus {
+  PENDING
+  IN_PROGRESS
+  DONE
+  SKIPPED
+}
+
+model Content {
+  id            String        @id @default(cuid())
+  accountId     String
+  account       Account       @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  topicId       String?
+  topic         Topic?        @relation(fields: [topicId], references: [id], onDelete: SetNull)
+  title         String        @default("")
+  body          String        @default("")
+  summary       String        @default("")
+  wordCount     Int           @default(0)
+  status        ContentStatus @default(DRAFT)
+  reviewNotes   String        @default("")
+  images        String        @default("[]") // JSON array of {alt, caption, base64}
+  wechatMediaId String?
+  publishedAt   DateTime?
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+
+  @@index([accountId, status])
+}
+
+enum ContentStatus {
+  DRAFT
+  REVIEWING
+  READY
+  PUBLISHED
+  REJECTED
+}
+
+model TaskRun {
+  id         String    @id @default(cuid())
+  accountId  String
+  account    Account   @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  taskType   TaskType
+  status     RunStatus @default(RUNNING)
+  input      String    @default("{}")
+  output     String    @default("{}")
+  error      String?
+  durationMs Int?
+  startedAt  DateTime  @default(now())
+  finishedAt DateTime?
+
+  @@index([accountId, taskType])
+
+  verificationReports VerificationReport[]
+}
+
+enum TaskType {
+  TREND_CRAWL
+  TOPIC_SELECT
+  RESEARCH
+  WRITE
+  GENERATE_IMAGES
+  REVIEW
+  PUBLISH
+  FULL_PIPELINE
+}
+
+enum RunStatus {
+  RUNNING
+  SUCCESS
+  FAILED
+  CANCELLED
+}
+
+model ScheduledTask {
+  id        String   @id @default(cuid())
+  accountId String
+  account   Account  @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  name      String
+  taskType  TaskType
+  cronExpr  String
+  config    String   @default("{}")
+  isEnabled Boolean  @default(true)
+  lastRunAt DateTime?
+  nextRunAt DateTime?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// Tracks review scores over time for quality monitoring.
+model QualityRecord {
+  id             String   @id @default(cuid())
+  accountId      String
+  account        Account  @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  topicId        String?
+  contentId      String?
+  score          Float    // Review score (0-10)
+  passed         Boolean
+  issues         String   @default("[]") // JSON array of issue strings
+  suggestions    String   @default("[]") // JSON array of suggestion strings
+  wordCount      Int      @default(0)
+  imageCount     Int      @default(0)
+  writeAttempts  Int      @default(1) // How many write attempts before passing
+  createdAt      DateTime @default(now())
+
+  @@index([accountId, createdAt])
+}
+
+// Per-step quality verification reports for the expert skill system.
+model VerificationReport {
+  id         String   @id @default(cuid())
+  taskRunId  String?
+  taskRun    TaskRun? @relation(fields: [taskRunId], references: [id], onDelete: SetNull)
+  step       String   // StepType / TaskType value
+  status     String   // VerificationStatus: PASS/FAIL/WARN/SKIP
+  inputData  String   @default("{}")  // JSON
+  outputData String   @default("{}")  // JSON
+  issues     String   @default("[]")  // JSON array
+  warnings   String   @default("[]")  // JSON array
+  score      Float?
+  durationMs Int?
+  retryCount Int      @default(0)
+  createdAt  DateTime @default(now())
+
+  @@index([step, status])
+  @@index([taskRunId])
+}

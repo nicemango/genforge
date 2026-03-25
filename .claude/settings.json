@@ -1,0 +1,8 @@
+{
+  "env": {
+    "ANTHROPIC_AUTH_TOKEN": "sk-cp-m2JsChxmQnpsHA6IUQnnHAcOPesB6_D2mgsvhJTTPirXbkAi3wytJxmpkNf3NGDphLEfW2O1MuQGZRHeov63mWdHKfWUmx7ZcyIS4hAx8V9oQrT70yMcL3E",
+    "ANTHROPIC_BASE_URL": "https://api.minimaxi.com/anthropic",
+    "ANTHROPIC_MODEL": "MiniMax-M2.7",
+    "CLAUDE_CODE_ATTRIBUTION_HEADER": "0"
+  }
+}
