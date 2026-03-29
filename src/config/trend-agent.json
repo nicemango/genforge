@@ -1,10 +1,8 @@
 {
-  "model": {
-    "provider": "openai",
-    "model": "Kimi-K2.5",
-    "apiKey": "470165fc-9617-4d34-a1c2-3a453b1cb8f2",
-    "baseURL": "https://ark.cn-beijing.volces.com/api/coding/v1"
-  },
+  "$schema": "../config/llm-providers.schema.json",
+  "_comment": "Trend Agent 配置 - 模型通过 llm-providers.json 统一管理",
+
+  "provider": "volcengine-kimi",
   "agent": {
     "topic": "ai",
     "maxArticlesPerSource": 20,

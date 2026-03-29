@@ -9,6 +9,7 @@ const NAV_ITEMS = [
   { href: '/contents', label: '内容', icon: ContentIcon },
   { href: '/accounts', label: '账号', icon: AccountIcon },
   { href: '/tasks', label: '任务', icon: TaskIcon },
+  { href: '/wallpapers', label: '壁纸', icon: WallpaperIcon },
 ]
 
 export default function Sidebar() {
@@ -16,15 +17,27 @@ export default function Sidebar() {
 
   return (
     <aside className="w-56 flex-shrink-0 flex flex-col" style={{ background: 'var(--color-card)', borderRight: '1px solid var(--color-border)' }}>
+      {/* Logo */}
       <div className="h-16 flex items-center px-5" style={{ borderBottom: '1px solid var(--color-border)' }}>
-        <div className="flex items-center gap-2">
-          <div className="w-8 h-8 rounded-lg flex items-center justify-center" style={{ background: 'var(--color-primary)' }}>
-            <span className="text-white text-sm font-bold">CC</span>
+        <Link href="/" className="flex items-center gap-2.5 group">
+          <div className="w-9 h-9 rounded-xl flex items-center justify-center transition-transform duration-300 group-hover:scale-105"
+            style={{ background: 'linear-gradient(135deg, var(--color-primary) 0%, var(--color-primary-dark) 100%)' }}
+          >
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M12 2L2 7l10 5 10-5-10-5z"/>
+              <path d="M2 17l10 5 10-5"/>
+              <path d="M2 12l10 5 10-5"/>
+            </svg>
           </div>
-          <span className="text-sm font-semibold" style={{ color: 'var(--color-fg)' }}>Content Center</span>
-        </div>
+          <div className="flex flex-col">
+            <span className="text-sm font-bold leading-tight" style={{ color: 'var(--color-fg)' }}>Content</span>
+            <span className="text-xs font-medium leading-tight" style={{ color: 'var(--color-primary)' }}>Center</span>
+          </div>
+        </Link>
       </div>
-      <nav className="flex-1 py-4 px-3 space-y-1">
+
+      {/* Navigation */}
+      <nav className="flex-1 py-3 px-3 space-y-0.5">
         {NAV_ITEMS.map((item) => {
           const isActive = pathname === item.href || (item.href !== '/' && pathname.startsWith(item.href))
           const Icon = item.icon
@@ -32,22 +45,35 @@ export default function Sidebar() {
             <Link
               key={item.href}
               href={item.href}
-              className="flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm transition-all duration-300"
+              className="flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm transition-all duration-200 group relative overflow-hidden"
               style={{
                 background: isActive ? 'var(--color-primary-alpha)' : 'transparent',
                 color: isActive ? 'var(--color-primary)' : 'var(--color-fg-muted)',
-                fontWeight: isActive ? 'var(--font-weight-semibold)' : 'var(--font-weight-medium)',
               }}
             >
-              <Icon active={isActive} />
-              {item.label}
+              {/* Active indicator */}
+              {isActive && (
+                <span className="absolute left-0 top-1/2 -translate-y-1/2 w-1 h-6 rounded-r-full" style={{ background: 'var(--color-primary)' }} />
+              )}
+
+              <span className="transition-transform duration-200 group-hover:scale-110"
+                style={{ color: isActive ? 'var(--color-primary)' : 'var(--color-fg-muted)' }}
+              >
+                <Icon active={isActive} />
+              </span>
+              <span className={`font-medium ${isActive ? 'font-semibold' : ''}`}>{item.label}</span>
             </Link>
           )
         })}
       </nav>
+
+      {/* Footer */}
       <div className="p-4" style={{ borderTop: '1px solid var(--color-border)' }}>
-        <div className="text-xs" style={{ color: 'var(--color-fg-subtle)' }}>
-          AI 自动化内容生产
+        <div className="flex items-center gap-2 px-3 py-2 rounded-xl" style={{ background: 'var(--color-bg-secondary)' }}>
+          <span className="w-2 h-2 rounded-full animate-pulse" style={{ background: 'var(--color-success)' }} />
+          <span className="text-xs font-medium" style={{ color: 'var(--color-fg-muted)' }}>
+            AI 就绪
+          </span>
         </div>
       </div>
     </aside>
@@ -101,6 +127,16 @@ function TaskIcon({ active }: { active: boolean }) {
     <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke={active ? 'var(--color-primary)' : 'currentColor'} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
       <circle cx="12" cy="12" r="10" />
       <polyline points="12 6 12 12 16 14" />
+    </svg>
+  )
+}
+
+function WallpaperIcon({ active }: { active: boolean }) {
+  return (
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke={active ? 'var(--color-primary)' : 'currentColor'} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <rect x="3" y="3" width="18" height="18" rx="2" />
+      <circle cx="8.5" cy="8.5" r="1.5" />
+      <path d="M21 15l-5-5L5 21" />
     </svg>
   )
 }

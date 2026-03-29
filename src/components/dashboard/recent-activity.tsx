@@ -61,11 +61,19 @@ export default function RecentActivity({ contents, tasks }: RecentActivityProps)
   }
 
   return (
-    <div className="card">
+    <div className="card card-hover">
       <div className="flex items-center justify-between mb-4">
-        <h2 className="text-lg font-semibold" style={{ color: 'var(--color-fg)', letterSpacing: 'var(--tracking-tight)' }}>
-          最近动态
-        </h2>
+        <div className="flex items-center gap-2">
+          <div className="w-8 h-8 rounded-lg flex items-center justify-center" style={{ background: 'var(--color-primary-alpha)' }}>
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--color-primary)" strokeWidth="2" strokeLinecap="round">
+              <circle cx="12" cy="12" r="10"/>
+              <polyline points="12 6 12 12 16 14"/>
+            </svg>
+          </div>
+          <h2 className="text-lg font-semibold" style={{ color: 'var(--color-fg)', letterSpacing: 'var(--tracking-tight)' }}>
+            最近动态
+          </h2>
+        </div>
         {/* Tab switcher */}
         <div className="flex gap-1 p-1 rounded-lg" style={{ background: 'var(--color-bg-secondary)' }}>
           {(['all', 'contents', 'tasks'] as const).map((tab) => (

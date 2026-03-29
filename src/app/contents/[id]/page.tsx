@@ -11,7 +11,7 @@ export default async function ContentDetailPage({ params }: { params: Promise<{ 
     where: { id },
     include: {
       topic: true,
-      account: { select: { id: true, name: true } },
+      account: { select: { id: true, name: true, wechatConfig: true, writingStyle: true } },
     },
   })
 

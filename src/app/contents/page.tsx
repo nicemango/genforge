@@ -33,9 +33,24 @@ export default async function ContentsPage() {
   }
 
   return (
-    <div className="space-y-4">
+    <div className="space-y-4 animate-fade-in">
+      {/* Header */}
       <div className="flex items-center justify-between">
-        <p className="text-sm" style={{ color: 'var(--color-fg-muted)' }}>共 {contents.length} 篇内容</p>
+        <div className="flex items-center gap-3">
+          <div className="w-10 h-10 rounded-xl flex items-center justify-center" style={{ background: 'rgba(22,163,74,0.1)' }}>
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="var(--color-success)" strokeWidth="2" strokeLinecap="round">
+              <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+              <polyline points="14 2 14 8 20 8"/>
+              <line x1="16" y1="13" x2="8" y2="13"/>
+              <line x1="16" y1="17" x2="8" y2="17"/>
+              <line x1="10" y1="9" x2="8" y2="9"/>
+            </svg>
+          </div>
+          <div>
+            <h1 className="text-lg font-bold" style={{ color: 'var(--color-fg)', letterSpacing: 'var(--tracking-tight)' }}>内容管理</h1>
+            <p className="text-sm" style={{ color: 'var(--color-fg-muted)' }}>共 {contents.length} 篇内容</p>
+          </div>
+        </div>
       </div>
 
       <div className="table-container" style={{ overflowX: 'auto' }}>

@@ -1,11 +1,15 @@
 /**
  * MiniMax Text to Speech HD 语音合成脚本
- * 使用 MiniMax speech-01 模型将文本转换为语音
+ * 使用 MiniMax speech-2.8-hd 模型将文本转换为语音
  *
  * 用法:
- *   npx tsx scripts/minimax-tts.ts --text "你好，这是测试语音"
- *   npx tsx scripts/minimax-tts.ts --file ./article.txt --output ./audio.mp3
- *   npx tsx scripts/minimax-tts.ts --model speech-01-hd --voice "male-qnq" --speed 1.0 --text "Hello"
+ *   npx tsx --env-file=.env scripts/minimax-tts.ts --text "你好，这是测试语音"
+ *   npx tsx --env-file=.env scripts/minimax-tts.ts --file ./article.txt --output ./audio.mp3
+ *   npx tsx --env-file=.env scripts/minimax-tts.ts --voice female-tianmei --speed 1.0 --text "Hello"
+ *
+ * 音色列表 (--voice):
+ *   female-tianmei (甜美女声), female-shawn, female-yichan, female-qnq
+ *   male-qnq, male-boyang, male-qingfeng, male-yunyang
  */
 
 import { parseArgs } from 'util'
@@ -58,8 +62,8 @@ const SUPPORTED_VOICES = [
   'live_dashu',
 ]
 
-const DEFAULT_VOICE = 'female-yichan'
-const DEFAULT_MODEL = 'speech-01-hd'
+const DEFAULT_VOICE = 'female-tianmei'
+const DEFAULT_MODEL = 'speech-2.8-hd'
 const DEFAULT_SPEED = 1.0
 const BASE_URL = 'https://api.minimaxi.com/v1/t2a_v2'
 
@@ -69,25 +73,45 @@ async function generateSpeech(
 ): Promise<TTSResponse> {
   const { model, text, voiceSetting, audioSetting } = request
 
+  // 构建请求体，确保使用 snake_case 字段名
+  const requestBody: Record<string, unknown> = {
+    model,
+    text,
+  }
+
+  if (voiceSetting) {
+    requestBody.voice_setting = {
+      voice_id: voiceSetting.voiceId,
+      speed: voiceSetting.speed ?? DEFAULT_SPEED,
+    }
+  } else {
+    requestBody.voice_setting = {
+      voice_id: DEFAULT_VOICE,
+      speed: DEFAULT_SPEED,
+    }
+  }
+
+  if (audioSetting) {
+    requestBody.audio_setting = {
+      sample_rate: audioSetting.sampleRate ?? 32000,
+      bitrate: audioSetting.bitrate ?? 128000,
+      format: audioSetting.format ?? 'mp3',
+    }
+  } else {
+    requestBody.audio_setting = {
+      sample_rate: 32000,
+      bitrate: 128000,
+      format: 'mp3',
+    }
+  }
+
   const response = await fetch(BASE_URL, {
     method: 'POST',
     headers: {
       'Authorization': `Bearer ${apiKey}`,
       'Content-Type': 'application/json',
     },
-    body: JSON.stringify({
-      model,
-      text,
-      voice_setting: voiceSetting ?? {
-        voice_id: DEFAULT_VOICE,
-        speed: String(DEFAULT_SPEED),
-      },
-      audio_setting: audioSetting ?? {
-        sample_rate: 32000,
-        bitrate: 128000,
-        format: 'mp3',
-      },
-    }),
+    body: JSON.stringify(requestBody),
     signal: AbortSignal.timeout(60000),
   })
 
@@ -96,12 +120,26 @@ async function generateSpeech(
     throw new Error(`MiniMax TTS API error: HTTP ${response.status} — ${errorBody}`)
   }
 
-  // TTS API 返回的是二进制音频数据或 JSON
+  // TTS API 返回 JSON，包含 base64 编码的音频数据
   const contentType = response.headers.get('content-type') ?? ''
 
   if (contentType.includes('application/json')) {
-    const data = await response.json() as { audio_file?: string; trace_id?: string }
-    return { audioFile: data.audio_file, traceId: data.trace_id }
+    const data = await response.json() as {
+      data?: { audio?: string; audio_file?: string }
+      base_resp?: { status_code: number; status_msg: string }
+    }
+
+    // 检查 API 错误
+    if (data.base_resp && data.base_resp.status_code !== 0) {
+      throw new Error(`MiniMax TTS API error: ${data.base_resp.status_msg} (code: ${data.base_resp.status_code})`)
+    }
+
+    const audioBase64 = data.data?.audio ?? data.data?.audio_file
+    if (!audioBase64) {
+      throw new Error('No audio data in response')
+    }
+
+    return { audioBase64 }
   }
 
   // 返回二进制音频数据

@@ -10,6 +10,39 @@ import { getTrendModelConfig } from '@/lib/trend-config'
 import { getTopicModelConfig } from '@/lib/topic-config'
 import { getResearchModelConfig } from '@/lib/research-config'
 import { createAgentProvider } from '@/lib/providers/registry'
+import * as fs from 'fs'
+import * as path from 'path'
+
+function loadLocalEnv() {
+  const files = ['.env.local', '.env']
+  for (const file of files) {
+    const p = path.resolve(process.cwd(), file)
+    if (!fs.existsSync(p)) continue
+
+    const content = fs.readFileSync(p, 'utf-8')
+    for (const rawLine of content.split(/\r?\n/)) {
+      const line = rawLine.trim()
+      if (!line || line.startsWith('#')) continue
+
+      const normalized = line.startsWith('export ') ? line.slice('export '.length).trim() : line
+      const idx = normalized.indexOf('=')
+      if (idx <= 0) continue
+
+      const key = normalized.slice(0, idx).trim()
+      if (!key) continue
+      if (process.env[key] != null) continue
+
+      let value = normalized.slice(idx + 1).trim()
+      if (
+        (value.startsWith('"') && value.endsWith('"')) ||
+        (value.startsWith("'") && value.endsWith("'"))
+      ) {
+        value = value.slice(1, -1)
+      }
+      process.env[key] = value
+    }
+  }
+}
 
 async function testProvider(name: string, modelConfig: Parameters<typeof createAgentProvider>[1]) {
   console.log(`\n${'='.repeat(50)}`)
@@ -20,7 +53,7 @@ async function testProvider(name: string, modelConfig: Parameters<typeof createA
   console.log(`  provider: ${modelConfig.provider}`)
   console.log(`  model: ${modelConfig.model}`)
   console.log(`  baseURL: ${modelConfig.baseURL}`)
-  console.log(`  apiKey: ${modelConfig.apiKey.slice(0, 10)}...`)
+  console.log(`  apiKey: ${modelConfig.apiKey ? '✓ 已设置' : '✗ 未设置'}`)
 
   const provider = createAgentProvider(name, modelConfig)
 
@@ -52,6 +85,7 @@ async function testProvider(name: string, modelConfig: Parameters<typeof createA
 }
 
 async function main() {
+  loadLocalEnv()
   console.log(`
 ${'='.repeat(60)}
   统一模型配置测试 - Content Center

@@ -27,6 +27,7 @@ export async function GET(request: Request) {
         taskType: true,
         startedAt: true,
         input: true,
+        output: true,
         account: { select: { name: true } },
       },
     })
@@ -48,22 +49,43 @@ export async function GET(request: Request) {
 
     const runningDetails = running.map((r) => {
       let topicId: string | undefined
+      let currentProgress: { phase: string; current: number; total: number; message?: string } | undefined
       try {
         const input = JSON.parse(r.input) as { topicId?: string }
         topicId = input.topicId
       } catch { /* ignore */ }
+      // Extract currentProgress from FULL_PIPELINE's stored output
+      if (r.taskType === 'FULL_PIPELINE' && r.output) {
+        try {
+          const outputData = JSON.parse(r.output) as { currentProgress?: { phase: string; current: number; total: number; message?: string } }
+          currentProgress = outputData.currentProgress
+        } catch { /* ignore */ }
+      }
       return {
         taskType: r.taskType,
         startedAt: r.startedAt.toISOString(),
         topicId,
         topicTitle: topicId ? (topicMap[topicId] ?? null) : undefined,
         accountName: r.account.name,
+        currentProgress,
       }
     })
+
+    const [taskRuns] = await Promise.all([
+      prisma.taskRun.findMany({
+        orderBy: { startedAt: 'desc' },
+        take: 50,
+        include: {
+          account: { select: { id: true, name: true } },
+          children: { select: { id: true, taskType: true, status: true, startedAt: true, finishedAt: true, durationMs: true, output: true, error: true } },
+        },
+      }),
+    ])
 
     return NextResponse.json({
       runningSteps: running.map((r) => r.taskType),
       runningDetails,
+      taskRuns,
     })
   }
 

@@ -90,21 +90,24 @@ TrendAgent (爬取) ────► TaskRun (TREND_CRAWL)
 TopicAgent (LLM 筛选) ────► Topic 表 (PENDING)
     │
     ▼
-ResearchAgent (深度研究) ────► TaskRun (RESEARCH)
+按 topicIds 顺序逐个处理
+    │
+    ├──► ResearchAgent (深度研究) ────► TaskRun (RESEARCH)
+    │         │
+    │         ▼
+    ├──► WriterAgent (生成文章) ────► Content 表 (DRAFT)
+    │         │
+    │         ├──► ImageAgent (MiniMax 配图，非阻塞) ────► Content.images / 正文图片链接
+    │         │
+    │         ▼
+    ├──► ReviewAgent (质量审核)
+    │         │  ├─ score >= minScore ──► Content (READY) ──► PublishAgent ──► 微信草稿箱 ──► Content (PUBLISHED)
+    │         │  └─ score < minScore  ──► 注入 reviewFeedback 重试 WRITE（最多 maxWriteRetries 次）
+    │         │
+    │         └─ 全部重试失败后记录 failedTopics，继续处理下一个 topic
     │
     ▼
-WriterAgent (生成文章) ────► Content 表 (DRAFT)
-    │
-    ▼
-ImageAgent (MiniMax 配图) ────► Content.images 更新
-    │
-    ▼
-ReviewAgent (质量审核)
-    │  ┌─ score >= 7.0 ──► Content (READY)
-    └──┴─ score < 7.0 ──► 重试 WRITE (最多 2 次)
-                              │
-                              ▼
-PublishAgent ────► 微信草稿箱 ────► Content (PUBLISHED)
+返回第一个成功发布的 topic；若全部失败则整个 FULL_PIPELINE 失败
 ```
 
 ## 5. Pipeline 机制详解
@@ -217,7 +220,19 @@ interface PipelineInput {
 
 > **注意**：`workspaces/` 目录为运行时产物，仅用于本地开发和服务器部署。若需支持 serverless，需将 WorkspaceManager 存储层切换为数据库。
 
-### 5.3 质量门控 (Quality Gate)
+### 5.3 FULL_PIPELINE 编排逻辑
+
+`FULL_PIPELINE` 由 `src/pipeline/index.ts` 中的 `runStep({ step: "FULL_PIPELINE" })` 驱动，核心特征如下：
+
+1. **每一步都会创建 TaskRun**：包括 FULL_PIPELINE 本身，以及内部递归调用的各子步骤。
+2. **先全局、后逐 topic**：先执行一次 `TREND_CRAWL` 与 `TOPIC_SELECT`，再按 `topicIds` 顺序逐个处理。
+3. **逐 topic 串行执行**：单个 topic 内部顺序为 `RESEARCH → WRITE → GENERATE_IMAGES → REVIEW → PUBLISH`。
+4. **质量门控重试**：`REVIEW` 未达到 `qualityConfig.minScore` 时，会把结构化审稿反馈注入下一轮 `WRITE`，最多重试 `maxWriteRetries` 次。
+5. **图片生成非阻塞**：`GENERATE_IMAGES` 失败只记录 warning，不中断整条流水线。
+6. **支持 checkpoint / resume**：workspace 保存步骤产物、进度和缓存输出，中断后可恢复。
+7. **成功语义是“至少一个 topic 发布成功”**：返回第一个成功发布的 topic；若全部失败，则 FULL_PIPELINE 失败。
+
+### 5.4 质量门控 (Quality Gate)
 
 - **评分维度**：观点深度 · 文章结构 · 数据支撑 · 流畅度（各 0-10 分）
 - **总分**：四项平均 → 映射到 10 分制

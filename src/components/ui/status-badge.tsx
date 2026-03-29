@@ -1,17 +1,18 @@
-const STATUS_STYLES: Record<string, string> = {
-  PENDING: 'bg-[var(--color-bg-secondary)] text-[var(--color-fg-muted)]',
-  IN_PROGRESS: 'bg-[var(--color-info)]/10 text-[var(--color-info)]',
-  DONE: 'bg-[var(--color-success)]/10 text-[var(--color-success)]',
-  SKIPPED: 'bg-[var(--color-bg-tertiary)] text-[var(--color-fg-subtle)]',
-  DRAFT: 'bg-[var(--color-bg-secondary)] text-[var(--color-fg-muted)]',
-  REVIEWING: 'bg-[var(--color-warning)]/10 text-[var(--color-warning)]',
-  READY: 'bg-[var(--color-success)]/10 text-[var(--color-success)]',
-  PUBLISHED: 'bg-[var(--color-info)]/10 text-[var(--color-info)]',
-  REJECTED: 'bg-[var(--color-error)]/10 text-[var(--color-error)]',
-  RUNNING: 'bg-[var(--color-info)]/10 text-[var(--color-info)]',
-  SUCCESS: 'bg-[var(--color-success)]/10 text-[var(--color-success)]',
-  FAILED: 'bg-[var(--color-error)]/10 text-[var(--color-error)]',
-  CANCELLED: 'bg-[var(--color-bg-tertiary)] text-[var(--color-fg-subtle)]',
+// Status style definitions with dot indicators
+const STATUS_CONFIG: Record<string, { bg: string; text: string; dot: string; pulse?: boolean }> = {
+  PENDING: { bg: 'bg-[var(--color-bg-secondary)]', text: 'text-[var(--color-fg-muted)]', dot: 'bg-[var(--color-fg-subtle)]' },
+  IN_PROGRESS: { bg: 'bg-[var(--color-info)]/10', text: 'text-[var(--color-info)]', dot: 'bg-[var(--color-info)]', pulse: true },
+  DONE: { bg: 'bg-[var(--color-success)]/10', text: 'text-[var(--color-success)]', dot: 'bg-[var(--color-success)]' },
+  SKIPPED: { bg: 'bg-[var(--color-bg-tertiary)]', text: 'text-[var(--color-fg-subtle)]', dot: 'bg-[var(--color-fg-subtle)]' },
+  DRAFT: { bg: 'bg-[var(--color-bg-secondary)]', text: 'text-[var(--color-fg-muted)]', dot: 'bg-[var(--color-fg-subtle)]' },
+  REVIEWING: { bg: 'bg-[var(--color-warning)]/10', text: 'text-[var(--color-warning)]', dot: 'bg-[var(--color-warning)]', pulse: true },
+  READY: { bg: 'bg-[var(--color-success)]/10', text: 'text-[var(--color-success)]', dot: 'bg-[var(--color-success)]' },
+  PUBLISHED: { bg: 'bg-[var(--color-info)]/10', text: 'text-[var(--color-info)]', dot: 'bg-[var(--color-info)]' },
+  REJECTED: { bg: 'bg-[var(--color-error)]/10', text: 'text-[var(--color-error)]', dot: 'bg-[var(--color-error)]' },
+  RUNNING: { bg: 'bg-[var(--color-info)]/10', text: 'text-[var(--color-info)]', dot: 'bg-[var(--color-info)]', pulse: true },
+  SUCCESS: { bg: 'bg-[var(--color-success)]/10', text: 'text-[var(--color-success)]', dot: 'bg-[var(--color-success)]' },
+  FAILED: { bg: 'bg-[var(--color-error)]/10', text: 'text-[var(--color-error)]', dot: 'bg-[var(--color-error)]' },
+  CANCELLED: { bg: 'bg-[var(--color-bg-tertiary)]', text: 'text-[var(--color-fg-subtle)]', dot: 'bg-[var(--color-fg-subtle)]' },
 }
 
 const STATUS_LABELS: Record<string, string> = {
@@ -30,14 +31,23 @@ const STATUS_LABELS: Record<string, string> = {
   CANCELLED: '已取消',
 }
 
-export default function StatusBadge({ status }: { status: string }) {
-  const style = STATUS_STYLES[status] ?? 'bg-[var(--color-bg-secondary)] text-[var(--color-fg-muted)]'
+export default function StatusBadge({ status, showDot = true }: { status: string; showDot?: boolean }) {
+  const config = STATUS_CONFIG[status] ?? {
+    bg: 'bg-[var(--color-bg-secondary)]',
+    text: 'text-[var(--color-fg-muted)]',
+    dot: 'bg-[var(--color-fg-subtle)]'
+  }
   const label = STATUS_LABELS[status] ?? status
 
   return (
     <span
-      className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium ${style}`}
+      className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-xs font-medium ${config.bg} ${config.text}`}
     >
+      {showDot && (
+        <span
+          className={`w-1.5 h-1.5 rounded-full ${config.dot} ${config.pulse ? 'animate-pulse' : ''}`}
+        />
+      )}
       {label}
     </span>
   )

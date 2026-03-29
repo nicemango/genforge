@@ -79,42 +79,56 @@ export default function ArticleResearchPanel({ accounts }: { accounts: Account[]
   }
 
   return (
-    <div className="card space-y-4">
-      <h2
-        className="text-lg font-semibold"
-        style={{ color: 'var(--color-fg)', letterSpacing: 'var(--tracking-tight)' }}
-      >
-        文章研究
-      </h2>
+    <div className="card card-hover space-y-4">
+      <div className="flex items-center gap-2">
+        <div className="w-8 h-8 rounded-lg flex items-center justify-center" style={{ background: 'var(--color-primary-alpha)' }}>
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--color-primary)" strokeWidth="2" strokeLinecap="round">
+            <circle cx="11" cy="11" r="8"/>
+            <path d="m21 21-4.35-4.35"/>
+          </svg>
+        </div>
+        <h2
+          className="text-lg font-semibold"
+          style={{ color: 'var(--color-fg)', letterSpacing: 'var(--tracking-tight)' }}
+        >
+          文章研究
+        </h2>
+      </div>
 
       {/* Account selector */}
       {accounts.length > 1 && (
-        <select
-          value={accountId}
-          onChange={(e) => setAccountId(e.target.value)}
-          className="w-full px-3 py-2 rounded-lg text-sm border"
-          style={{
-            background: 'var(--color-bg-secondary)',
-            borderColor: 'var(--color-border)',
-            color: 'var(--color-fg)',
-          }}
-        >
-          {accounts.map((a) => (
-            <option key={a.id} value={a.id}>{a.name}</option>
-          ))}
-        </select>
+        <div className="flex items-center gap-2">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--color-fg-muted)" strokeWidth="2">
+            <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/>
+            <circle cx="12" cy="7" r="4"/>
+          </svg>
+          <select
+            value={accountId}
+            onChange={(e) => setAccountId(e.target.value)}
+            className="flex-1 px-3 py-2 rounded-lg text-sm border focus-ring"
+            style={{
+              background: 'var(--color-bg-secondary)',
+              borderColor: 'var(--color-border)',
+              color: 'var(--color-fg)',
+            }}
+          >
+            {accounts.map((a) => (
+              <option key={a.id} value={a.id}>{a.name}</option>
+            ))}
+          </select>
+        </div>
       )}
 
       {/* Input type tabs */}
       <div
-        className="flex gap-1 p-1 rounded-lg w-fit"
+        className="inline-flex gap-1 p-1 rounded-xl"
         style={{ background: 'var(--color-bg-secondary)' }}
       >
         {(['url', 'text'] as const).map((type) => (
           <button
             key={type}
             onClick={() => { setInputType(type); setInput('') }}
-            className="px-3 py-1.5 rounded-md text-sm font-medium transition-all duration-200"
+            className="px-4 py-2 rounded-lg text-sm font-medium transition-all duration-200 flex items-center gap-2"
             style={
               inputType === type
                 ? {
@@ -125,7 +139,26 @@ export default function ArticleResearchPanel({ accounts }: { accounts: Account[]
                 : { color: 'var(--color-fg-muted)' }
             }
           >
-            {type === 'url' ? 'URL' : '粘贴文本'}
+            {type === 'url' ? (
+              <>
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                  <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/>
+                  <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/>
+                </svg>
+                链接
+              </>
+            ) : (
+              <>
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                  <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                  <polyline points="14 2 14 8 20 8"/>
+                  <line x1="16" y1="13" x2="8" y2="13"/>
+                  <line x1="16" y1="17" x2="8" y2="17"/>
+                  <line x1="10" y1="9" x2="8" y2="9"/>
+                </svg>
+                文本
+              </>
+            )}
           </button>
         ))}
       </div>

@@ -95,7 +95,7 @@ interface ResearchResult {
 | **合计** | **2000-2800字** | — |
 
 #### 配图占位符
-- 固定位置插入 `![描述](cover)` 占位符
+- 固定位置插入 `![描述](image:cover)` 和 `![描述](image:section-N)` 占位符
 - 开篇 1 张 + 每章 1 张，全文 3-4 张
 
 #### 重写机制
@@ -115,7 +115,7 @@ chineseChars + englishWords * 2 + Math.floor(numbers / 2)
 - 输入：文章标题 + 正文
 - 使用 `src/lib/minimax-image.ts` 中的 MiniMax 客户端
 - 生成 3-4 张配图（含 alt 描述和 caption）
-- 将 base64 图片嵌入正文 `](cover)` 位置
+- 按正文中的 `![描述](image:cover)` / `![描述](image:section-N)` 占位符顺序回填最终图片 URL
 
 **MiniMax API**：
 - 模型：`image-01`
@@ -175,16 +175,23 @@ runFullPipeline(input: PipelineInput): Promise<PipelineOutput>
 runStep(input: PipelineStepInput): Promise<PipelineOutput>
 ```
 
-### 2.2 PipelineInput 结构
+### 2.2 PipelineInput / PipelineStepInput 结构
 
 ```typescript
 interface PipelineInput {
   accountId: string
-  topicCount?: number        // TOPIC_SELECT 生成多少个选题，默认 5
-  topicId?: string           // 指定从哪个选题开始（用于 RESEARCH 及后续步骤）
-  reviewFeedback?: string     // REVIEW → WRITE 重试时的审核反馈
-  writeAttempts?: number     // 当前写尝试次数（内部管理）
+  topicCount?: number        // TOPIC_SELECT 生成多少个选题
+  topicId?: string           // 单步执行时指定 topic
+  reviewFeedback?: string    // REVIEW → WRITE 重试时注入的审稿反馈
+  retriesLeft?: number       // 内部字段
   workspaceId?: string       // Workspace ID，不提供则自动生成
+}
+
+interface PipelineStepInput extends PipelineInput {
+  step: TaskType
+  parentRunId?: string       // FULL_PIPELINE 下子步骤关联父 TaskRun
+  onProgress?: (info: StepProgressInfo) => void
+  writeAttempts?: number     // 传给 REVIEW 记录本次写作尝试次数
 }
 ```
 
@@ -201,17 +208,33 @@ interface PipelineInput {
 
 ### 2.4 FULL_PIPELINE 执行流程
 
+当前 `FULL_PIPELINE` 是“先全局步骤、再逐 topic 串行处理”的编排器：
+
+```text
+1. 幂等检查：同一 account 若已有 RUNNING 的 FULL_PIPELINE，则直接报错
+2. 初始化或恢复 workspace
+3. 执行全局步骤
+   3.1 TREND_CRAWL
+   3.2 TOPIC_SELECT
+4. 从 workspace/topic step 输出中取出 topicIds
+5. 按 topicIds 顺序逐个处理，每个 topic 执行：
+   5.1 RESEARCH(topicId)
+   5.2 WRITE(topicId)
+   5.3 GENERATE_IMAGES(topicId)   // 非阻塞，失败仅记录 warning
+   5.4 REVIEW(topicId)
+       ├─ passed = true  → PUBLISH(topicId)
+       └─ passed = false → buildReviewFeedback() 后重试 WRITE
+6. 单个 topic 的 WRITE / REVIEW 最多执行 maxWriteRetries + 1 轮
+7. 只要有一个 topic 成功发布，即返回第一个成功结果
+8. 若所有 topic 均失败，则返回 failed，并附 failedTopics 详情
 ```
-1. Idempotency 检查 → 存在 RUNNING 则抛错
-2. TREND_CRAWL
-3. TOPIC_SELECT → 取 topicIds[0]
-4. RESEARCH(topicId=firstTopicId)
-5. WRITE(topicId=firstTopicId)
-   └─ GENERATE_IMAGES（非阻塞）
-   └─ REVIEW(topicId=firstTopicId)
-      ├─ passed=true → 返回成功
-      └─ passed=false → 重试 WRITE + reviewFeedback（最多 maxWriteRetries 次）
-```
+
+补充说明：
+- 当前不是只处理 `topicIds[0]`，而是会遍历 `TOPIC_SELECT` 产出的所有 `topicIds`
+- topic 之间当前是串行执行，不是并行执行
+- `GENERATE_IMAGES` 是非阻塞步骤，不影响后续 REVIEW / PUBLISH
+- REVIEW 失败后的重写，依赖 `buildReviewFeedback()` 生成结构化反馈再注入 Writer
+- 最后一轮若仍未通过，但 Review 返回了 `fixedBody`，会将其回写到最后一篇内容中
 
 ### 2.5 质量配置（per Account）
 

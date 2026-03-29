@@ -151,29 +151,43 @@ export default function PipelineFlow({
       {/* Header + Account selector */}
       <div className="flex items-center justify-between gap-4 flex-wrap">
         <div>
-          <h2 className="text-xl font-bold" style={{ color: 'var(--color-fg)', letterSpacing: 'var(--tracking-tight)' }}>
-            内容生产流水线
-          </h2>
-          <p className="text-sm mt-1" style={{ color: 'var(--color-fg-muted)' }}>
+          <div className="flex items-center gap-2">
+            <h2 className="text-xl font-bold" style={{ color: 'var(--color-fg)', letterSpacing: 'var(--tracking-tight)' }}>
+              内容生产流水线
+            </h2>
+            {runningSteps.length > 0 && (
+              <span className="flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium"
+                style={{ background: 'var(--color-primary-alpha)', color: 'var(--color-primary)' }}
+              >
+                <span className="w-1.5 h-1.5 rounded-full bg-current animate-pulse" />
+                运行中
+              </span>
+            )}
+          </div>
+          <p className="text-sm mt-1.5" style={{ color: 'var(--color-fg-muted)' }}>
             点击任意步骤立即执行，或一键启动完整流程
           </p>
         </div>
         <div className="flex items-center gap-3">
-          <select
-            value={selectedAccountId}
-            onChange={(e) => setSelectedAccountId(e.target.value)}
-            className="px-3 py-2 rounded-lg text-sm border"
-            style={{
-              background: 'var(--color-bg-secondary)',
-              borderColor: 'var(--color-border)',
-              color: 'var(--color-fg)',
-            }}
+          <div className="flex items-center gap-2 px-3 py-2 rounded-lg"
+            style={{ background: 'var(--color-bg-secondary)' }}
           >
-            {accounts.length === 0 && <option value="">请先创建账号</option>}
-            {accounts.map((a) => (
-              <option key={a.id} value={a.id}>{a.name}</option>
-            ))}
-          </select>
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--color-fg-muted)" strokeWidth="2">
+              <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/>
+              <circle cx="12" cy="7" r="4"/>
+            </svg>
+            <select
+              value={selectedAccountId}
+              onChange={(e) => setSelectedAccountId(e.target.value)}
+              className="text-sm bg-transparent border-0 focus:outline-none"
+              style={{ color: 'var(--color-fg)', minWidth: '120px' }}
+            >
+              {accounts.length === 0 && <option value="">请先创建账号</option>}
+              {accounts.map((a) => (
+                <option key={a.id} value={a.id}>{a.name}</option>
+              ))}
+            </select>
+          </div>
         </div>
       </div>
 

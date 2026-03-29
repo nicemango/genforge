@@ -1,0 +1,72 @@
+{
+  "$schema": "./llm-providers.schema.json",
+  "_comment": "LLM Provider 配置 - 修改此文件即可切换模型",
+  "_usage": "修改 defaultProvider 字段即可切换默认模型，或在 agent 配置中指定 provider",
+
+  "defaultProvider": "minimax-m2",
+
+  "providers": {
+    "minimax-m2": {
+      "name": "MiniMax Token Plan",
+      "provider": "anthropic",
+      "model": "MiniMax-M2.5",
+      "apiKey": "${MINIMAX_API_KEY}",
+      "baseURL": "https://api.minimaxi.com/anthropic",
+      "enabled": true,
+      "quotaResetHour": null
+    },
+    "volcengine-kimi": {
+      "name": "火山引擎 Kimi",
+      "provider": "openai",
+      "model": "Kimi-K2.5",
+      "apiKey": "${VOLCENGINE_API_KEY}",
+      "baseURL": "https://ark.cn-beijing.volces.com/api/coding/v1",
+      "enabled": true,
+      "quotaResetHour": 7
+    },
+    "volcengine-deepseek": {
+      "name": "火山引擎 DeepSeek",
+      "provider": "openai",
+      "model": "deepseek-chat",
+      "apiKey": "${VOLCENGINE_API_KEY}",
+      "baseURL": "https://ark.cn-beijing.volces.com/api/coding/v1",
+      "enabled": true,
+      "quotaResetHour": 7
+    },
+    "anthropic-claude": {
+      "name": "Anthropic Claude",
+      "provider": "anthropic",
+      "model": "claude-sonnet-4-6",
+      "apiKey": "${ANTHROPIC_API_KEY}",
+      "baseURL": "",
+      "enabled": true,
+      "quotaResetHour": null
+    },
+    "anthropic-haiku": {
+      "name": "Anthropic Claude Haiku",
+      "provider": "anthropic",
+      "model": "claude-haiku-4-20250514",
+      "apiKey": "${ANTHROPIC_API_KEY}",
+      "baseURL": "",
+      "enabled": true,
+      "quotaResetHour": null
+    },
+    "openai-gpt4o": {
+      "name": "OpenAI GPT-4o",
+      "provider": "openai",
+      "model": "gpt-4o",
+      "apiKey": "${OPENAI_API_KEY}",
+      "baseURL": "",
+      "enabled": true,
+      "quotaResetHour": null
+    }
+  },
+
+  "agentDefaults": {
+    "trend": "minimax-m2",
+    "topic": "minimax-m2",
+    "research": "minimax-m2",
+    "writer": "minimax-m2",
+    "review": "minimax-m2"
+  }
+}

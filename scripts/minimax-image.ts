@@ -22,7 +22,7 @@ async function main() {
       output: { type: 'string', short: 'o', default: './generated_image.png' },
       aspect: { type: 'string', short: 'a', default: DEFAULT_ASPECT },
       model: { type: 'string', short: 'm', default: DEFAULT_MODEL },
-      n: { type: 'number', short: 'n', default: 1 },
+      n: { type: 'string', short: 'n', default: '1' },
       'api-key': { type: 'string' },
     },
   })
