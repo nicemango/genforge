@@ -1,10 +1,11 @@
 import { prisma } from "@/lib/prisma";
 import type { ModelConfig } from "@/lib/ai";
+import { getDefaultModelConfig, listConfiguredProviderModelConfigs } from "@/config/llm";
 import type { WritingStyle } from "@/agents/writer";
 import { runTrendAgent } from "@/agents/trend";
 import { runTopicAgent } from "@/agents/topic";
 import { runResearchAgent } from "@/agents/research";
-import { runWriterAgent } from "@/agents/writer";
+import { runWriterAgent, WRITER_PROMPT_VERSION } from "@/agents/writer";
 import { runImageAgent } from "@/agents/image";
 import {
   runReviewAgent,
@@ -13,13 +14,15 @@ import {
 } from "@/agents/review";
 import { runPublishAgent } from "@/agents/publisher";
 import { DEFAULT_QUALITY_CONFIG, type QualityConfig } from "@/lib/config";
-import { parseAccountJsonField } from "@/lib/json";
+import { parseAccountJsonField, parseWechatConfig } from "@/lib/json";
+import { replaceImageSlots } from "@/lib/image-plan";
 import type { PipelineInput, PipelineOutput, PipelineStepInput } from "./types";
 import type { TaskType } from "@prisma/client";
 import { PipelineCoordinator } from "@/skills/coordinator/pipeline-coordinator";
 import { workspaceManager, type AgentType } from "@/lib/workspace";
 import { uploadImage } from "@/lib/wechat";
 import { notifyTaskRunFailure, notifyPipelineComplete } from "@/lib/notifications";
+import { createAgentProvider } from "@/lib/providers/registry";
 
 /**
  * Safely parse a JSON string field from Account.
@@ -58,6 +61,135 @@ interface WritingStyleJson {
   style?: string[];
 }
 
+type AgentModelProbe = "trend" | "topic" | "research" | "writer" | "review" | "image";
+
+const MODEL_CONFIG_CACHE = new Map<string, Promise<ModelConfig>>();
+
+function getProbeAgent(step: PipelineStepInput["step"]): AgentModelProbe | null {
+  switch (step) {
+    case "TOPIC_SELECT":
+      return "topic";
+    case "RESEARCH":
+      return "research";
+    case "WRITE":
+      return "writer";
+    case "REVIEW":
+      return "review";
+    case "GENERATE_IMAGES":
+      return "image";
+    case "FULL_PIPELINE":
+      return "topic";
+    default:
+      return null;
+  }
+}
+
+function buildModelCandidates(modelConfig: ModelConfig): Array<{ label: string; modelConfig: ModelConfig }> {
+  const candidates: Array<{ label: string; modelConfig: ModelConfig }> = []
+  const seen = new Set<string>()
+
+  const pushCandidate = (label: string, candidate: ModelConfig) => {
+    const providerType = candidate.defaultProviderType ?? candidate.provider
+    const model = candidate.defaultModel ?? candidate.model ?? ""
+    const key = `${providerType}|${candidate.baseURL ?? ""}|${model}|${candidate.apiKey ? "with-key" : "no-key"}`
+    if (seen.has(key)) return
+    seen.add(key)
+    candidates.push({ label, modelConfig: candidate })
+  }
+
+  pushCandidate("account-config", modelConfig)
+
+  for (const configured of listConfiguredProviderModelConfigs()) {
+    pushCandidate(`provider:${configured.name}`, configured.modelConfig)
+  }
+
+  return candidates
+}
+
+function summarizeProviderError(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error)
+
+  if (message.includes("AccountQuotaExceeded")) {
+    return "quota exceeded"
+  }
+  if (message.includes("Request not allowed")) {
+    return "request not allowed"
+  }
+  if (message.includes("API key not set")) {
+    return "missing API key"
+  }
+  if (message.includes("not support model")) {
+    return "plan does not support model"
+  }
+  if (message.includes("UnsupportedModel")) {
+    return "model unsupported by endpoint"
+  }
+
+  return message.replace(/\s+/g, " ").slice(0, 160)
+}
+
+async function probeModelConfig(agentName: AgentModelProbe, modelConfig: ModelConfig): Promise<void> {
+  const provider = createAgentProvider(agentName, modelConfig)
+  await provider.chat(
+    [{ role: "user", content: "Reply with exactly OK" }],
+    { maxTokens: 8, temperature: 0 },
+  )
+}
+
+async function resolveUsableModelConfig(
+  accountId: string,
+  step: PipelineStepInput["step"],
+  modelConfig: ModelConfig,
+): Promise<ModelConfig> {
+  const probeAgent = getProbeAgent(step)
+  if (!probeAgent) {
+    return modelConfig
+  }
+
+  const cacheKey = `${accountId}:${probeAgent}`
+  const cached = MODEL_CONFIG_CACHE.get(cacheKey)
+  if (cached) {
+    return cached
+  }
+
+  const resolving = (async () => {
+    const errors: string[] = []
+
+    for (const candidate of buildModelCandidates(modelConfig)) {
+      const candidateModel = candidate.modelConfig.defaultModel ?? candidate.modelConfig.model
+      if (!candidate.modelConfig.apiKey || !candidateModel) {
+        errors.push(`${candidate.label}: incomplete credentials`)
+        continue
+      }
+
+      try {
+        await probeModelConfig(probeAgent, candidate.modelConfig)
+        if (candidate.label !== "account-config") {
+          console.warn(
+            `[ModelPreflight] ${probeAgent} falling back from account config to ${candidate.label}.`,
+          )
+        }
+        return candidate.modelConfig
+      } catch (error) {
+        errors.push(`${candidate.label}: ${summarizeProviderError(error)}`)
+      }
+    }
+
+    throw new Error(
+      `No usable model provider for ${probeAgent}. Tried ${errors.length} candidate(s): ${errors.join(" | ")}`,
+    )
+  })()
+
+  MODEL_CONFIG_CACHE.set(cacheKey, resolving)
+
+  try {
+    return await resolving
+  } catch (error) {
+    MODEL_CONFIG_CACHE.delete(cacheKey)
+    throw error
+  }
+}
+
 
 export async function runStep(
   input: PipelineStepInput,
@@ -71,6 +203,7 @@ export async function runStep(
       taskType: step,
       status: "RUNNING",
       input: JSON.stringify(input),
+      parentRunId: input.parentRunId,
     },
   });
 
@@ -119,19 +252,32 @@ async function executeStep(
     ...DEFAULT_QUALITY_CONFIG,
     ...parseAccountJsonField<Partial<QualityConfig>>(account.qualityConfig, "qualityConfig", {}),
   };
+  const wechatConfig = parseWechatConfig(account.wechatConfig)
 
-  // Fall back to .env when account config doesn't provide credentials
+  // Fall back to .env / llm-providers.json when account config doesn't provide credentials
   if (!modelConfig.apiKey && !modelConfig.defaultModel) {
-    modelConfig = {
-      ...modelConfig,
-      defaultProviderType:
-        (process.env.DEFAULT_AI_PROVIDER_TYPE as "anthropic" | "openai") ??
-        "anthropic",
-      apiKey: process.env.DEFAULT_AI_API_KEY ?? "",
-      baseURL: process.env.DEFAULT_AI_BASE_URL,
-      defaultModel: process.env.DEFAULT_AI_MODEL,
-    };
+    // Prefer DEFAULT_AI_* env vars if set, otherwise use llm-providers.json defaults
+    const envApiKey = process.env.DEFAULT_AI_API_KEY
+    if (envApiKey) {
+      modelConfig = {
+        ...modelConfig,
+        defaultProviderType:
+          (process.env.DEFAULT_AI_PROVIDER_TYPE as "anthropic" | "openai") ??
+          "anthropic",
+        apiKey: envApiKey,
+        baseURL: process.env.DEFAULT_AI_BASE_URL,
+        defaultModel: process.env.DEFAULT_AI_MODEL,
+      }
+    } else {
+      // Use llm-providers.json default provider
+      modelConfig = {
+        ...modelConfig,
+        ...getDefaultModelConfig(),
+      }
+    }
   }
+
+  modelConfig = await resolveUsableModelConfig(input.accountId, input.step, modelConfig)
 
   // Initialize coordinator (skip for FULL_PIPELINE as it calls runStep recursively)
   const isFullPipeline = input.step === "FULL_PIPELINE"
@@ -179,7 +325,14 @@ async function executeStep(
 
   switch (input.step) {
     case "TREND_CRAWL": {
-      const result = await runTrendAgent();
+      const result = await runTrendAgent(undefined, (info) => {
+        input.onProgress?.({
+          phase: 'crawling',
+          current: info.current,
+          total: info.total,
+          message: info.sourceName ? `${info.sourceName} (${info.current}/${info.total})` : `${info.current}/${info.total}`,
+        })
+      });
       validateStepOutput(input, result, true);
       return {
         itemCount: result.items.length,
@@ -220,6 +373,7 @@ async function executeStep(
         input.topicCount != null ? { count: input.topicCount } : undefined,
       );
 
+      // V2: 存储新的洼地策略字段
       const created = await Promise.all(
         result.topics.map((t) =>
           prisma.topic.create({
@@ -229,6 +383,11 @@ async function executeStep(
               angle: t.angle,
               summary: t.summary,
               heatScore: t.heatScore,
+              valueScore: t.valueScore,
+              redSeaLevel: t.redSeaLevel,
+              contrarianAngle: t.contrarianAngle,
+              timeToMainstream: t.timeToMainstream,
+              selectionStrategy: result.strategy,
               tags: JSON.stringify(t.tags),
               sources: JSON.stringify(t.sources),
               status: "PENDING",
@@ -241,6 +400,7 @@ async function executeStep(
         topics: result.topics,
         topicCount: created.length,
         topicIds: created.map((t) => t.id),
+        strategy: result.strategy,
       };
       validateStepOutput(input, topicResult, true);
       return topicResult;
@@ -264,6 +424,10 @@ async function executeStep(
         angle: topic.angle,
         summary: topic.summary,
         heatScore: topic.heatScore,
+        valueScore: topic.valueScore,
+        redSeaLevel: topic.redSeaLevel as "LOW" | "MEDIUM" | "HIGH",
+        contrarianAngle: topic.contrarianAngle,
+        timeToMainstream: topic.timeToMainstream as "NOW" | "WEEKS" | "MONTHS",
         tags: JSON.parse(topic.tags) as string[],
         sources: JSON.parse(topic.sources) as Array<{
           title: string;
@@ -276,13 +440,14 @@ async function executeStep(
 
       const researchResult = {
         topicId: input.topicId,
+        summary: result.summary,
         researchSummary: result.summary,
         keyPointCount: result.keyPoints.length,
         keyPoints: result.keyPoints,
         sources: result.sources,
         rawOutput: result.rawOutput,
       };
-      validateStepOutput(input, researchResult, true);
+      validateStepOutput(input, researchResult, false);
       return researchResult;
     }
 
@@ -333,6 +498,10 @@ async function executeStep(
         angle: topic.angle,
         summary: topic.summary,
         heatScore: topic.heatScore,
+        valueScore: topic.valueScore,
+        redSeaLevel: topic.redSeaLevel as "LOW" | "MEDIUM" | "HIGH",
+        contrarianAngle: topic.contrarianAngle,
+        timeToMainstream: topic.timeToMainstream as "NOW" | "WEEKS" | "MONTHS",
         tags: JSON.parse(topic.tags) as string[],
         sources: JSON.parse(topic.sources) as Array<{
           title: string;
@@ -345,15 +514,23 @@ async function executeStep(
         where: { id: researchRun.id },
       });
 
+      const researchTaskOutput = parseTaskRunJSON<{
+        summary?: string;
+        researchSummary?: string;
+        keyPoints?: string[];
+        sources?: Array<{ title: string; url: string; verified: boolean }>;
+        rawOutput?: string;
+      }>(fullResearchOutput.output, fullResearchOutput.id, "output");
+
       const researchResult = {
-        summary: "",
-        keyPoints: [] as string[],
-        sources: topicSuggestion.sources.map((s) => ({
+        summary: researchTaskOutput.researchSummary ?? researchTaskOutput.summary ?? "",
+        keyPoints: researchTaskOutput.keyPoints ?? [],
+        sources: researchTaskOutput.sources ?? topicSuggestion.sources.map((s) => ({
           title: s.title,
           url: s.url,
           verified: false,
         })),
-        rawOutput: fullResearchOutput.output,
+        rawOutput: researchTaskOutput.rawOutput ?? fullResearchOutput.output ?? "",
       };
 
       const result = await runWriterAgent(
@@ -362,6 +539,7 @@ async function executeStep(
         modelConfig,
         writingStyle,
         input.reviewFeedback,
+        input.writeAttempts, // 0 = first, 1 = retry, 2 = last try
       );
 
       const content = await prisma.content.create({
@@ -372,6 +550,7 @@ async function executeStep(
           body: result.body,
           summary: result.summary,
           wordCount: result.wordCount,
+          writerPromptVersion: WRITER_PROMPT_VERSION,
           status: "DRAFT",
         },
       });
@@ -383,10 +562,7 @@ async function executeStep(
 
       const writeResult = {
         contentId: content.id,
-        title: result.title,
-        body: result.body,
-        summary: result.summary,
-        wordCount: result.wordCount,
+        ...result,
       };
       validateStepOutput(input, writeResult, false);
       return writeResult;
@@ -408,63 +584,74 @@ async function executeStep(
       if (!content)
         throw new Error(`No DRAFT content found for topic ${input.topicId}.`);
 
-      // Fall back to env var if not set in account config
+      // If MiniMax is absent, the image agent will degrade AI slots to template cards.
       const minimaxApiKey =
         modelConfig.minimaxApiKey ?? process.env.MINIMAX_API_KEY ?? undefined;
-      if (!minimaxApiKey) {
-        throw new Error(
-          "MiniMax API key not configured. Set MINIMAX_API_KEY in .env or account modelConfig.minimaxApiKey.",
-        );
-      }
 
       const result = await runImageAgent(
         content.title,
         content.body,
         minimaxApiKey,
         modelConfig,
+        {
+          writingStyle,
+          layoutConfig: {
+            themeId: wechatConfig.themeId,
+            brandName: wechatConfig.brandName ?? writingStyle.brandName,
+            primaryColor: wechatConfig.primaryColor,
+            accentColor: wechatConfig.accentColor,
+            titleAlign: wechatConfig.titleAlign,
+            showEndingCard: wechatConfig.showEndingCard,
+            endingCardText: wechatConfig.endingCardText,
+            imageStyle: wechatConfig.imageStyle,
+          },
+        },
       );
 
       // Upload images to WeChat permanent material and get URLs
       const imageUploadResults = await Promise.allSettled(
-        result.imagePlaceholders.map(async (img) => {
+        result.assets.map(async (img) => {
+          if (!img.imageBase64) {
+            return { ...img, url: img.url, uploadStatus: 'failed' as const }
+          }
           try {
             const url = await uploadImage(input.accountId, img.imageBase64)
-            return { alt: img.alt, caption: img.caption, url }
+            return {
+              ...img,
+              url,
+              uploadStatus: 'uploaded' as const,
+              qualityStatus: img.qualityStatus === 'downgraded' ? 'downgraded' as const : 'passed' as const,
+            }
           } catch (err) {
             console.warn(`[GENERATE_IMAGES] Failed to upload image to WeChat: ${err instanceof Error ? err.message : String(err)}`)
-            // Fall back to base64 data URL if WeChat upload fails
-            return { alt: img.alt, caption: img.caption, url: `data:image/jpeg;base64,${img.imageBase64}` }
+            const fallbackUrl = img.imageBase64 ? `data:${img.mimeType};base64,${img.imageBase64}` : img.url
+            return {
+              ...img,
+              url: fallbackUrl,
+              uploadStatus: 'inline' as const,
+              qualityStatus: img.qualityStatus ?? 'failed',
+              fallbackReason: img.fallbackReason ?? 'Image upload failed; kept inline data URL',
+            }
           }
         }),
       )
 
       // Extract successful uploads
-      const imageData: Array<{ alt: string; caption: string; url: string }> = []
-      for (const result of imageUploadResults) {
-        if (result.status === 'fulfilled') {
-          imageData.push(result.value)
+      const imageData: typeof result.assets = []
+      for (const uploadResult of imageUploadResults) {
+        if (uploadResult.status === 'fulfilled') {
+          imageData.push(uploadResult.value)
         }
       }
 
-      // Replace all (cover) markers in body with WeChat image URLs sequentially.
-      let updatedBody = content.body
-      const placeholderCount = (content.body.match(/\]\(cover\)/g) || []).length
-      const imageCount = imageData.length
-      if (placeholderCount !== imageCount) {
+      const placeholders = content.body.match(/!\[[^\]]*\]\(image:(?:cover|section-\d+|para-\d+)\)/g) ?? []
+      if (placeholders.length !== result.assets.length) {
         console.warn(
-          `[GENERATE_IMAGES] Placeholder/image count mismatch: ${placeholderCount} placeholders in body, ${imageCount} images processed.`,
+          `[GENERATE_IMAGES] Placeholder/image count mismatch: ${placeholders.length} placeholders in body, ${result.assets.length} assets planned.`,
         )
       }
 
-      for (const img of imageData) {
-        const coverIdx = updatedBody.indexOf("](cover)")
-        if (coverIdx !== -1) {
-          updatedBody =
-            updatedBody.slice(0, coverIdx) +
-            `](${img.url})` +
-            updatedBody.slice(coverIdx + 8) // 8 = len('](cover)')
-        }
-      }
+      const updatedBody = replaceImageSlots(content.body, imageData)
 
       await prisma.content.update({
         where: { id: content.id },
@@ -477,6 +664,8 @@ async function executeStep(
       const imageResult = {
         contentId: content.id,
         imageCount: imageData.length,
+        imagePlan: result.imagePlan,
+        assets: imageData,
       };
       // GENERATE_IMAGES is non-blocking: failures are logged but don't halt pipeline
       validateStepOutput(input, imageResult, false);
@@ -544,6 +733,7 @@ async function executeStep(
           writeAttempts:
             (input as PipelineStepInput & { writeAttempts?: number })
               .writeAttempts ?? 1,
+          writerPromptVersion: content.writerPromptVersion,
         },
       });
 
@@ -581,6 +771,7 @@ async function executeStep(
         content.title,
         content.body,
         content.summary,
+        { contentId: content.id },
       );
 
       await prisma.content.update({
@@ -592,7 +783,7 @@ async function executeStep(
         },
       });
 
-      const publishResult = { contentId: content.id, mediaId: result.mediaId };
+      const publishResult = { contentId: content.id, mediaId: result.mediaId, publishedAt: result.publishedAt };
       validateStepOutput(input, publishResult, true);
       return publishResult;
     }
@@ -684,6 +875,17 @@ async function executeStep(
       // Helper to run a step with workspace context
       const runStepWithWorkspace = async (step: TaskType, stepInput: Partial<PipelineStepInput>, stepAgentType: AgentType, topicId?: string): Promise<PipelineOutput> => {
         const cacheKey = topicId ? perTopicKey(stepAgentType, topicId) : stepAgentType
+        // Progress reporter: writes to workspace so UI can poll
+        const onProgress = async (info: { phase: string; current: number; total: number; message?: string }) => {
+          if (workspaceId) {
+            await workspaceManager.writeProgress(workspaceId, {
+              phase: info.phase,
+              current: info.current,
+              total: info.total,
+              message: info.message,
+            })
+          }
+        }
         // For resumed steps, try to use previous output if available
         if (previousOutputs[cacheKey]) {
           console.log(`[FULL_PIPELINE] Skipping step ${step}${topicId ? ` for topic ${topicId}` : ''} (using cached output from workspace)`)
@@ -693,7 +895,7 @@ async function executeStep(
             output: previousOutputs[cacheKey],
           }
         }
-        const result = await runStep({ ...input, ...stepInput, step, workspaceId } as PipelineStepInput)
+        const result = await runStep({ ...input, ...stepInput, step, workspaceId, parentRunId: currentTaskRunId, onProgress } as PipelineStepInput)
         if (result.status === "failed") {
           if (workspaceId) {
             await workspaceManager.setStatus(workspaceId, "failed")
@@ -755,42 +957,50 @@ async function executeStep(
             let topicSucceeded = false
 
             for (let attempt = 0; attempt <= maxRetries; attempt++) {
-              const writeStepInput =
-                attempt === 0
-                  ? { step: "WRITE" as const, topicId }
-                  : {
-                      step: "WRITE" as const,
-                      topicId,
-                      reviewFeedback,
-                      writeAttempts: attempt + 1,
-                    }
+              console.log(`[FULL_PIPELINE] Topic ${topicId}: Attempt ${attempt + 1}/${maxRetries + 1}`)
 
-              const cacheKey = perTopicKey("write", topicId)
-              // Check if we should use cached write output on retry
-              if (attempt > 0 && previousOutputs[cacheKey]) {
-                console.log(`[FULL_PIPELINE] Topic ${topicId}: Using cached write output for attempt ${attempt}`)
-                lastWriteOutput = previousOutputs[cacheKey]
-              } else {
-                const writeResult = await runStepWithWorkspace("WRITE", writeStepInput, "write", topicId)
-                if (writeResult.status === "failed")
-                  throw new Error(`WRITE failed: ${writeResult.error}`)
-                lastWriteOutput = writeResult.output
-              }
+              if (attempt < maxRetries) {
+                // 第 0 次和第 1 次：正常 WRITE
+                const writeStepInput =
+                  attempt === 0
+                    ? { step: "WRITE" as const, topicId }
+                    : {
+                        step: "WRITE" as const,
+                        topicId,
+                        reviewFeedback,
+                        writeAttempts: attempt + 1,
+                      }
 
-              // GENERATE_IMAGES: skip on failure, non-blocking
-              const imageCacheKey = perTopicKey("images", topicId)
-              if (!previousOutputs[imageCacheKey] && !completedStepsForTopic.includes("images")) {
-                const imageResult = await runStep({
-                  ...input,
-                  step: "GENERATE_IMAGES",
-                  topicId,
-                  workspaceId,
-                })
-                if (imageResult.status === "failed") {
-                  console.warn(`[FULL_PIPELINE] Topic ${topicId}: GENERATE_IMAGES skipped: ${imageResult.error}`)
+                const cacheKey = perTopicKey("write", topicId)
+                // Check if we should use cached write output on retry
+                if (attempt > 0 && previousOutputs[cacheKey]) {
+                  console.log(`[FULL_PIPELINE] Topic ${topicId}: Using cached write output for attempt ${attempt}`)
+                  lastWriteOutput = previousOutputs[cacheKey]
                 } else {
-                  await checkpointStep("images", imageResult.output, topicId)
+                  const writeResult = await runStepWithWorkspace("WRITE", writeStepInput, "write", topicId)
+                  if (writeResult.status === "failed")
+                    throw new Error(`WRITE failed: ${writeResult.error}`)
+                  lastWriteOutput = writeResult.output
                 }
+
+                // GENERATE_IMAGES: skip on failure, non-blocking
+                const imageCacheKey = perTopicKey("images", topicId)
+                if (!previousOutputs[imageCacheKey] && !completedStepsForTopic.includes("images")) {
+                  const imageResult = await runStep({
+                    ...input,
+                    step: "GENERATE_IMAGES",
+                    topicId,
+                    workspaceId,
+                  })
+                  if (imageResult.status === "failed") {
+                    console.warn(`[FULL_PIPELINE] Topic ${topicId}: GENERATE_IMAGES skipped: ${imageResult.error}`)
+                  } else {
+                    await checkpointStep("images", imageResult.output, topicId)
+                  }
+                }
+              } else {
+                // 第 2 次（最后一次）：直接使用 review.fixedBody，不再 WRITE
+                console.log(`[FULL_PIPELINE] Topic ${topicId}: Last attempt - using review.fixedBody directly`)
               }
 
               // REVIEW
@@ -799,6 +1009,7 @@ async function executeStep(
                 step: "REVIEW",
                 topicId,
                 workspaceId,
+                writeAttempts: attempt + 1,
               })
               if (reviewResult.status === "failed")
                 throw new Error(`REVIEW failed: ${reviewResult.error}`)
@@ -812,6 +1023,7 @@ async function executeStep(
                 suggestions: string[];
                 dimensionScores?: DimensionScores;
                 writerBrief?: WriterBrief;
+                fixedBody?: string;
               };
               lastReviewOutput = reviewData
 
@@ -848,6 +1060,22 @@ async function executeStep(
                 console.warn(
                   `[FULL_PIPELINE] Topic ${topicId}: Review attempt ${attempt + 1} failed (score: ${reviewData.score}). Retrying with feedback.`,
                 )
+              } else {
+                // 最后一次失败：直接使用 review.fixedBody 作为最终 body
+                console.warn(`[FULL_PIPELINE] Topic ${topicId}: All attempts failed - using review.fixedBody as final content`)
+                if (reviewData.fixedBody) {
+                  const content = await prisma.content.findFirst({
+                    where: { accountId: input.accountId, topicId: topicId, status: "REJECTED" },
+                    orderBy: { createdAt: "desc" },
+                  })
+                  if (content) {
+                    await prisma.content.update({
+                      where: { id: content.id },
+                      data: { body: reviewData.fixedBody, status: "DRAFT" },
+                    })
+                    console.log(`[FULL_PIPELINE] Topic ${topicId}: Updated content with review.fixedBody`)
+                  }
+                }
               }
             }
 

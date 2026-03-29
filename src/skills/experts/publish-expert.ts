@@ -60,8 +60,8 @@ function parseWechatConfig(config: unknown): WechatConfig {
 function isValidMediaId(mediaId: string | number | undefined): boolean {
   if (mediaId === undefined || mediaId === null) return false
   const str = String(mediaId)
-  // WeChat media_id is typically 32-64 chars, alphanumeric + underscore
-  return /^[a-zA-Z0-9_]{10,}$/.test(str)
+  // WeChat media_id is typically 32-64 chars, alphanumeric + underscore + hyphen
+  return /^[a-zA-Z0-9_-]{10,}$/.test(str)
 }
 
 function isValidDate(dateStr: string | number | undefined): boolean {
@@ -188,8 +188,8 @@ export const publishExpert: ExpertSkill = {
         warnings.push('convertedHtml 中未发现段落或标题标签，HTML 结构可能异常')
       }
       // Check for unresolved placeholders
-      if (html.includes('](cover)')) {
-        warnings.push('convertedHtml 中仍存在未替换的图片占位符 [](cover)')
+      if (/!\[[^\]]*\]\(image:(?:cover|section-\d+)\)/.test(html)) {
+        warnings.push('convertedHtml 中仍存在未替换的图片占位符（image:cover / image:section-N）')
       }
       // Check for base64 images
       const base64Images = (html.match(/data:image\/[^;]+;base64,/g) ?? []).length
@@ -244,7 +244,7 @@ export const publishExpert: ExpertSkill = {
       recommendations.push('HTML 转换可能不完整，建议检查 markdownToWechatHtml 函数输出')
     }
 
-    if (allWarnings.some((w) => w.includes('](cover)'))) {
+    if (allWarnings.some((w) => w.includes('未替换的图片占位符'))) {
       recommendations.push('存在未生成的图片占位符，建议在图片生成后再发布')
     }
 

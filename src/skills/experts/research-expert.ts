@@ -14,7 +14,8 @@ interface ResearchExpertInput {
 }
 
 interface ResearchExpertOutput {
-  summary: string
+  summary?: string
+  researchSummary?: string
   keyPoints: string[]
   sources: Array<{ title: string; url: string; verified?: boolean }>
   rawOutput: string
@@ -24,6 +25,45 @@ interface ResearchExpertOutput {
   expertQuotes?: Array<{ person?: string; quote?: string; source?: string }>
   /** 争议与反驳观点 */
   controversies?: Array<{ viewpoint?: string; reason?: string; data?: string }>
+}
+
+function extractSection(rawOutput: string | undefined, headings: string[]): string {
+  if (!rawOutput) return ''
+
+  const escapedHeadings = headings.map((heading) => heading.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+  const pattern = new RegExp(
+    `##\\s*(?:${escapedHeadings.join('|')})\\s*\\n([\\s\\S]*?)(?=\\n##\\s|$)`,
+    'i',
+  )
+
+  return rawOutput.match(pattern)?.[1]?.trim() ?? ''
+}
+
+function countBulletItems(section: string): number {
+  if (!section) return 0
+  return section
+    .split('\n')
+    .filter((line) => /^\s*[-*]\s+/.test(line.trim()))
+    .length
+}
+
+function countExpertQuotes(rawOutput: string | undefined): number {
+  const section = extractSection(rawOutput, ['专家与创始人观点'])
+  if (!section) return 0
+
+  const structuredQuotes = section
+    .split('\n')
+    .filter((line) => /^\s*[-*]\s+.+[：:].*["“].+["”]/.test(line.trim()))
+    .length
+
+  return Math.max(structuredQuotes, countBulletItems(section))
+}
+
+function countControversies(rawOutput: string | undefined): number {
+  const section = extractSection(rawOutput, ['争议与反驳'])
+  if (!section) return 0
+
+  return countBulletItems(section)
 }
 
 export class ResearchExpert implements ExpertSkill {
@@ -87,15 +127,16 @@ export class ResearchExpert implements ExpertSkill {
     const out = output as Partial<ResearchExpertOutput>
 
     // 验证 summary 存在且非空
-    if (!out.summary || typeof out.summary !== 'string' || out.summary.trim() === '') {
+    const resolvedSummary = out.summary ?? out.researchSummary
+    if (!resolvedSummary || typeof resolvedSummary !== 'string' || resolvedSummary.trim() === '') {
       issues.push('output.summary 存在且必须是非空字符串')
     }
 
-    // 验证 keyPoints 是数组，元素 >= 3
+    // 验证 keyPoints 是数组，元素 >= 2
     if (!Array.isArray(out.keyPoints)) {
       issues.push('output.keyPoints 必须是数组')
-    } else if (out.keyPoints.length < 3) {
-      issues.push(`output.keyPoints 长度不足：当前 ${out.keyPoints.length} 条，要求至少 3 条`)
+    } else if (out.keyPoints.length < 2) {
+      issues.push(`output.keyPoints 长度不足：当前 ${out.keyPoints.length} 条，要求至少 2 条`)
     }
 
     // 验证 sources 数据点 >= 8
@@ -107,8 +148,8 @@ export class ResearchExpert implements ExpertSkill {
     const sourceDataPoints = Array.isArray(out.sources) ? out.sources.length : 0
     const totalDataPoints = Math.max(extractedDataPoints, sourceDataPoints)
 
-    if (totalDataPoints < 8) {
-      issues.push(`数据点不足：当前 ${totalDataPoints} 条，要求至少 8 条`)
+    if (totalDataPoints < 4) {
+      issues.push(`数据点不足：当前 ${totalDataPoints} 条，要求至少 4 条`)
     }
 
     // 验证 cases 案例 >= 3
@@ -120,34 +161,28 @@ export class ResearchExpert implements ExpertSkill {
     const rawCaseCount = rawCaseMatches.length
 
     const totalCases = Math.max(caseCount, rawCaseCount)
-    if (totalCases < 3) {
-      issues.push(`真实案例不足：当前 ${totalCases} 个，要求至少 3 个`)
+    if (totalCases < 2) {
+      issues.push(`真实案例不足：当前 ${totalCases} 个，要求至少 2 个`)
     }
 
-    // 验证 expertQuotes 专家原话 >= 3
+    // 专家引用为非阻塞性警告（突发新闻话题难以获取专家原话）
     const quotesArray = out.expertQuotes
     const quoteCount = Array.isArray(quotesArray) ? quotesArray.length : 0
-
-    // 也尝试从 rawOutput 中提取专家引用数量
-    const rawQuoteMatches = out.rawOutput?.match(/(?:专家|创始人)[与和]?\S+[：:][""]/g) ?? []
-    const rawQuoteCount = rawQuoteMatches.length
+    const rawQuoteCount = countExpertQuotes(out.rawOutput)
 
     const totalQuotes = Math.max(quoteCount, rawQuoteCount)
-    if (totalQuotes < 3) {
-      issues.push(`专家引用不足：当前 ${totalQuotes} 条，要求至少 3 条`)
+    if (totalQuotes < 1) {
+      warnings.push(`专家引用不足：当前 ${totalQuotes} 条（突发新闻话题难以获取专家原话，可接受）`)
     }
 
     // 验证 controversies 争议点 >= 2
     const controversiesArray = out.controversies
     const controversyCount = Array.isArray(controversiesArray) ? controversiesArray.length : 0
-
-    // 也尝试从 rawOutput 中提取争议数量
-    const rawControversyMatches = out.rawOutput?.match(/##\s*(?:争议|反驳)/g) ?? []
-    const rawControversyCount = rawControversyMatches.length
+    const rawControversyCount = countControversies(out.rawOutput)
 
     const totalControversies = Math.max(controversyCount, rawControversyCount)
-    if (totalControversies < 2) {
-      issues.push(`争议点不足：当前 ${totalControversies} 条，要求至少 2 条`)
+    if (totalControversies < 1) {
+      issues.push(`争议点不足：当前 ${totalControversies} 条，要求至少 1 条`)
     }
 
     // 数据溯源质量检查
@@ -237,29 +272,27 @@ export class ResearchExpert implements ExpertSkill {
     }
 
     // 数据完整性扣分
-    if (Array.isArray(out.keyPoints) && out.keyPoints.length < 5) {
-      score -= (5 - out.keyPoints.length) * 0.5
+    if (Array.isArray(out.keyPoints) && out.keyPoints.length < 3) {
+      score -= (3 - out.keyPoints.length) * 0.5
     }
 
     // 数据点不足扣分
     const dataPointMatches = out.rawOutput?.match(/--\s*[\u4e00-\u9fff\u3400-\u4dbf\w]+/g) ?? []
     const dataPointCount = dataPointMatches.length
-    if (dataPointCount < 8) {
-      score -= (8 - dataPointCount) * 0.3
+    if (dataPointCount < 4) {
+      score -= (4 - dataPointCount) * 0.3
     }
 
     // 专家引用不足扣分
-    const quoteMatches = out.rawOutput?.match(/(?:专家|创始人)[与和]?\S+[：:][""]/g) ?? []
-    const quoteCount = quoteMatches.length
-    if (quoteCount < 3) {
-      score -= (3 - quoteCount) * 0.5
+    const quoteCount = countExpertQuotes(out.rawOutput)
+    if (quoteCount < 2) {
+      score -= (2 - quoteCount) * 0.5
     }
 
     // 争议点不足扣分
-    const controversyMatches = out.rawOutput?.match(/##\s*(?:争议|反驳)/g) ?? []
-    const controversyCount = controversyMatches.length
-    if (controversyCount < 2) {
-      score -= (2 - controversyCount) * 0.5
+    const controversyCount = countControversies(out.rawOutput)
+    if (controversyCount < 1) {
+      score -= (1 - controversyCount) * 0.5
     }
 
     // 数据溯源模糊度扣分

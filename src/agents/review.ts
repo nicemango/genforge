@@ -1,120 +1,47 @@
 import { createAgentProvider, type ModelConfig, type ChatResponse } from '@/lib/ai'
+import {
+  type DimensionScores,
+  type WriterBrief,
+  type WriterBriefMustFix,
+  type DimensionResult,
+  PERSPECTIVE_SPECIALIST_PROMPT,
+  STRUCTURE_SPECIALIST_PROMPT,
+  DATA_SUPPORT_SPECIALIST_PROMPT,
+  FLUENCY_SPECIALIST_PROMPT,
+  SYNTHESIS_PROMPT,
+} from './review-specialists'
 
-export interface DimensionScores {
-  perspective: number   // 观点深度 (0-10): 观点鲜明有立场，不是理中客；有独特洞察
-  structure: number     // 文章结构 (0-10): 开头钩子、中间论证、结尾收束；章节标题自带观点
-  dataSupport: number   // 数据支撑 (0-10): 具体公司/产品/数字 ≥ 5处，有来源或合理解释
-  fluency: number        // 流畅度 (0-10): 语句通顺无语病，无空洞套话，标点正确
-}
-
-export interface WriterBriefMustFix {
-  priority: 'P0' | 'P1' | 'P2'
-  location: string
-  problem: string
-  fix: string
-}
-
-export interface WriterBrief {
-  coreProblem: string
-  mustFix: WriterBriefMustFix[]
-  keepGood: string[]
-}
+export type { DimensionScores, WriterBrief, WriterBriefMustFix }
 
 export interface ReviewResult {
   score: number
   passed: boolean
   dimensionScores: DimensionScores
-  reasoning: string[]        // 每项扣分的原因说明，对应 dimensionScores 的每一项
-  issues: string[]            // 具体问题列表，带段落位置引用
-  suggestions: string[]       // 按优先级排序的可执行修改建议
-  fixedBody?: string          // score < 7.0 时输出修复后的完整正文
-  writerBrief?: WriterBrief   // score < 7.0 时输出的精炼写作修改指南
+  reasoning: string[]
+  issues: string[]
+  suggestions: string[]
+  fixedBody?: string
+  writerBrief?: WriterBrief
 }
 
 // ============================================================
-// 审核 Prompt — 对齐「科技猫」写作规范（优化版 v2）
+// Preprocess Helpers
 // ============================================================
-const REVIEW_SYSTEM_PROMPT = `你是一位严格的「科技猫」公众号编辑，审核 AI/科技类文章是否符合品牌写作规范。
 
-## 预检（评分前必须完成）
-
-扫描文章标记以下问题：
-- A. 废话开场：开头300字是否为"随着XX发展..."/"在XX时代..."/"近年来..."/"本文将..."型
-- B. 废话结尾：结尾200字是否含"感谢阅读"/"希望有帮助"/"祝好"/"以上就是全部内容"
-- C. 描述性标题：## 标题是否为"第一章"型编号或"市场分析"/"行业现状"型无观点描述（合格标题应自带观点）
-
-## 评分标准（4项各10分，均值为总分）
-
-### 1. 观点深度 (perspective)
-| 分数 | 条件 |
-|------|------|
-| 9-10 | 核心观点明确亮出+有独特洞察+无"理中客"表述 |
-| 7-8 | 有明确观点但洞察被常识稀释 |
-| 5-6 | 观点模糊，信息罗列多于观点输出 |
-| 0-4 | 几乎无观点，全篇定性描述或废话套话 |
-
-"理中客"定义：同时声称"XX有道理YY也有道理"/"见仁见智"；"一方面...另一方面..."两边辩护；"需要综合考虑"。每处扣3分。空洞废话每处扣2分。
-
-### 2. 文章结构 (structure)
-| 分数 | 条件 |
-|------|------|
-| 9-10 | 开头300字内有Hook+章节标题自带观点+结尾三层次（观点总结+行动建议+留白） |
-| 7-8 | Hook合格+结尾基本合格+不超过1处描述性标题 |
-| 5-6 | 背景介绍式开头（扣5分）+描述性标题（每处扣3分）+结尾空洞 |
-| 0-4 | 全文无结构 |
-
-废话结尾扣10分；要点罗列结尾扣5分；三层次缺一扣3分。
-
-### 3. 数据支撑 (dataSupport)
-具体数据 = 公司/产品名+具体数字 或 有来源的百分比/对比。"投入大量资金"不算。
-| 分数 | 条件 |
-|------|------|
-| 9-10 | >= 5处具体数据，大部分有来源 |
-| 7-8 | 3-4处具体数据 |
-| 5-6 | 1-2处数据或大量空洞描述 |
-| 0-4 | 无具体数据 |
-
-空洞无来源数据每个扣2分。
-
-### 4. 流畅度 (fluency)
-| 分数 | 条件 |
-|------|------|
-| 9-10 | 无病句无错别字标点正确 |
-| 7-8 | 1-2处语病 |
-| 5-6 | 3-5处语病 |
-| 0-4 | 超5处语病 |
-
-每处语病/错别字扣1分（上限5分）。
-
-## 总分 = (perspective + structure + dataSupport + fluency) / 4，>= 7.0 通过
-
-## 输出格式（严格JSON，无其他文字）
-
-score >= 7.0 时：
-{ "score", "passed": true, "dimensionScores": {...}, "reasoning": [...每项扣分原因], "preCheckIssues": [...], "issues": [], "suggestions": [...] }
-
-score < 7.0 时额外输出 fixedBody + writerBrief：
-{ "score", "passed": false, "dimensionScores", "reasoning", "preCheckIssues",
-  "issues": ["【问题类型】【位置】具体问题+扣分"],
-  "suggestions": [按高/中/低优先级排序],
-  "writerBrief": { "coreProblem": "一句话核心失败原因", "mustFix": [{ "priority":"P0/P1/P2", "location", "problem", "fix":"改成这样：XXX" }], "keepGood": [...] },
-  "fixedBody": "完整修复后正文（逐条解决issues，保留配图占位符）"
+function stripBase64Images(body: string): string {
+  return body.replace(/!\[([^\]]*)\]\(data:image\/jpeg;base64,[^)]+\)/g, '![$1](image)')
 }
 
-## issues 规范
-必须包含：具体位置+具体问题+扣分分值。禁止模糊表述如"整体不够深入""建议优化"。
+function countChineseWords(text: string): number {
+  const chineseChars = text.match(/[\u4e00-\u9fff\u3400-\u4dbf]/g)?.length ?? 0
+  const englishWords = (text.match(/[a-zA-Z]+/g)?.length ?? 0) * 2
+  const digitCount = text.match(/\d/g)?.length ?? 0
+  return chineseChars + englishWords + Math.ceil(digitCount * 0.5)
+}
 
-## fixedBody 标准
-1. 逐条解决 issues  2. 不引入新问题  3. 不改核心观点和数据  4. 保留 ![描述](cover) 占位符`
-
-/**
- * Dynamically extract company/brand/product entities from article text
- * using pattern-based heuristics (no hardcoded list).
- */
 function extractEntities(text: string): string[] {
   const entities = new Set<string>()
 
-  // English brand names: capitalized words or known patterns (2+ chars, not common English words)
   const englishBrands = text.match(/\b[A-Z][a-zA-Z]{1,20}(?:\s[A-Z][a-zA-Z]+)?\b/g) ?? []
   const commonWords = new Set([
     'The', 'This', 'That', 'What', 'When', 'Where', 'How', 'Why', 'Who',
@@ -129,13 +56,11 @@ function extractEntities(text: string): string[] {
     }
   }
 
-  // Chinese company/brand patterns: 2-6 char names followed by entity suffixes
   const cnCorpMatches = text.match(/[\u4e00-\u9fff]{2,6}(?:科技|集团|公司|资本|智能|机器人|半导体)/g) ?? []
   for (const m of cnCorpMatches) {
     entities.add(m)
   }
 
-  // Abbreviations / all-caps tech brands (e.g., NVIDIA, AI, API excluded)
   const abbrevMatches = text.match(/\b[A-Z]{2,10}\b/g) ?? []
   const excludeAbbrev = new Set(['AI', 'API', 'URL', 'SDK', 'SaaS', 'GPU', 'CPU', 'LLM', 'NLP', 'ML', 'AR', 'VR', 'MR', 'XR', 'IoT', 'USB', 'HTML', 'CSS', 'HTTP', 'JSON', 'XML', 'SQL', 'RSS'])
   for (const a of abbrevMatches) {
@@ -147,95 +72,326 @@ function extractEntities(text: string): string[] {
   return [...entities].slice(0, 30)
 }
 
+interface PreCheckResult {
+  hasFluffOpening: boolean
+  hasFluffClosing: boolean
+  hasDescriptiveTitle: boolean
+  preCheckIssues: string[]
+}
+
+function runPreCheck(title: string, body: string): PreCheckResult {
+  const issues: string[] = []
+  const opening300 = body.slice(0, 300)
+  const closing200 = body.slice(-200)
+
+  const fluffOpeningPatterns = [/随着.*发展/, /在.*时代/, /近年来/, /本文将/]
+  const hasFluffOpening = fluffOpeningPatterns.some((p) => p.test(opening300))
+  if (hasFluffOpening) {
+    issues.push('【预检】【开头】废话开场：使用了"随着XX发展..."/"在XX时代..."等套话')
+  }
+
+  const fluffClosingPatterns = [/感谢阅读/, /希望有帮助/, /祝好/, /以上就是全部内容/]
+  const hasFluffClosing = fluffClosingPatterns.some((p) => p.test(closing200))
+  if (hasFluffClosing) {
+    issues.push('【预检】【结尾】废话结尾：使用了"感谢阅读"/"祝好"等客套话')
+  }
+
+  const descriptiveTitlePatterns = [/^第.+章/, /^第一部分/, /^第二部分/, /^市场分析/, /^行业现状/]
+  const hasDescriptiveTitle = descriptiveTitlePatterns.some((p) => p.test(title))
+  if (hasDescriptiveTitle) {
+    issues.push('【预检】【标题】描述性标题：标题无观点，应自带鲜明立场')
+  }
+
+  return { hasFluffOpening, hasFluffClosing, hasDescriptiveTitle, preCheckIssues: issues }
+}
+
+function buildPreCheckData(body: string): string {
+  const wordCount = countChineseWords(body)
+  const imagePlaceholders = body.match(/!\[[^\]]*\]\(image:(?:cover|section-\d+|para-\d+)\)/g) ?? []
+  const imageCount = imagePlaceholders.length
+  const detectedCompanies = extractEntities(body)
+  const numbers = body.match(/\d+(\.\d+)?[%亿万千万亿]?/g) ?? []
+  const dataPoints = numbers.slice(0, 20).join('、')
+
+  return [
+    '## 预检数据（仅供参考，请实际阅读正文判断）',
+    `字数：${wordCount} 字`,
+    `配图占位符：${imageCount} 张`,
+    '检测到的公司/品牌名：' + (detectedCompanies.length > 0 ? detectedCompanies.join('、') : '无'),
+    '检测到的数字/数据：' + (dataPoints || '无'),
+  ].join('\n')
+}
+
+// ============================================================
+// JSON Parsing Helpers
+// ============================================================
+
+function extractJsonFromResponse(text: string): string {
+  let jsonStr = text.trim()
+  const codeBlockMatch = jsonStr.match(/```(?:json)?\s*\n?([\s\S]+?)\n?```/)
+  if (codeBlockMatch) {
+    jsonStr = codeBlockMatch[1].trim()
+  }
+  const start = jsonStr.indexOf('{')
+  const bracketStart = jsonStr.indexOf('[')
+  // Prefer { } over [ ] when both exist
+  if (start === -1 && bracketStart === -1) {
+    // No JSON structure found - return whole text and let JSON.parse give the real error
+    return jsonStr
+  }
+  if (start === -1) start = Number.MAX_SAFE_INTEGER
+  if (bracketStart === -1) bracketStart = Number.MAX_SAFE_INTEGER
+  const actualStart = Math.min(start, bracketStart)
+  const closer = actualStart === start ? '}' : ']'
+  let end = jsonStr.lastIndexOf(closer)
+  if (end === -1 || end < actualStart) {
+    // JSON might be truncated
+    end = jsonStr.length
+  }
+  return jsonStr.slice(actualStart, end + 1)
+}
+
+function extractStringArrayFromJsonLike(text: string, field: string): string[] {
+  const match = text.match(new RegExp(`"${field}"\\s*:\\s*\\[([\\s\\S]*?)\\]`))
+  if (!match?.[1]) return []
+  return [...match[1].matchAll(/"((?:\\.|[^"])*)"/g)]
+    .map((entry) => entry[1]?.replace(/\\"/g, '"').trim())
+    .filter(Boolean) as string[]
+}
+
+function parseDimensionResultFallback(
+  text: string,
+  expectedDimension: DimensionResult['dimension'],
+): DimensionResult | null {
+  const jsonStr = extractJsonFromResponse(text)
+  const scoreMatch = jsonStr.match(/"score"\s*:\s*([0-9]+(?:\.[0-9]+)?)/)
+  const reasoningMatch = jsonStr.match(/"reasoning"\s*:\s*"([\s\S]*?)"\s*,\s*"issues"/)
+
+  if (!scoreMatch) return null
+
+  return {
+    dimension: expectedDimension,
+    score: Number(scoreMatch[1] ?? 0),
+    reasoning: (reasoningMatch?.[1] ?? '').replace(/\\"/g, '"').trim(),
+    issues: extractStringArrayFromJsonLike(jsonStr, 'issues'),
+    suggestions: extractStringArrayFromJsonLike(jsonStr, 'suggestions'),
+  }
+}
+
+function parseDimensionResult(text: string, expectedDimension: DimensionResult['dimension']): DimensionResult {
+  const jsonStr = extractJsonFromResponse(text)
+
+  let parsed: DimensionResult
+  try {
+    parsed = JSON.parse(jsonStr) as DimensionResult
+  } catch (err) {
+    const fallback = parseDimensionResultFallback(text, expectedDimension)
+    if (!fallback) {
+      throw new Error(
+        `[${expectedDimension}] Failed to parse JSON: ${err instanceof Error ? err.message : String(err)}. ` +
+          `Raw snippet: ${jsonStr.slice(0, 300)}`,
+      )
+    }
+    parsed = fallback
+  }
+
+  // Ensure dimension matches expected
+  if (parsed.dimension !== expectedDimension) {
+    parsed.dimension = expectedDimension
+  }
+
+  // Clamp score to 0-10
+  const rawScore = Number(parsed.score ?? 0)
+  parsed.score = Number.isFinite(rawScore) ? Math.max(0, Math.min(10, rawScore)) : 0
+
+  // Ensure arrays
+  parsed.reasoning = Array.isArray(parsed.reasoning) ? parsed.reasoning.join('; ') : String(parsed.reasoning ?? '')
+  parsed.issues = Array.isArray(parsed.issues) ? parsed.issues : []
+  parsed.suggestions = Array.isArray(parsed.suggestions) ? parsed.suggestions : []
+
+  return parsed
+}
+
+// ============================================================
+// Specialist Evaluation
+// ============================================================
+
+interface SpecialistConfig {
+  dimension: DimensionResult['dimension']
+  name: string
+  prompt: string
+}
+
+const SPECIALISTS: SpecialistConfig[] = [
+  { dimension: 'perspective', name: '观点深度', prompt: PERSPECTIVE_SPECIALIST_PROMPT },
+  { dimension: 'structure', name: '文章结构', prompt: STRUCTURE_SPECIALIST_PROMPT },
+  { dimension: 'dataSupport', name: '数据支撑', prompt: DATA_SUPPORT_SPECIALIST_PROMPT },
+  { dimension: 'fluency', name: '流畅度', prompt: FLUENCY_SPECIALIST_PROMPT },
+]
+
+function buildSpecialistTask(
+  title: string,
+  body: string,
+  preCheckData: string,
+  dimension: DimensionResult['dimension'],
+): string {
+  return [
+    '## 文章标题\n' + title,
+    '\n## 文章正文\n' + body,
+    '\n' + preCheckData,
+    '\n请严格按照评分标准打分，每项扣分都必须有具体位置和原因。\n输出格式要求：只返回 JSON，不要有任何其他文字。',
+  ].join('\n')
+}
+
+async function evaluateDimension(
+  dimension: DimensionResult['dimension'],
+  name: string,
+  prompt: string,
+  title: string,
+  body: string,
+  preCheckData: string,
+  modelConfig: ModelConfig,
+): Promise<DimensionResult> {
+  const provider = createAgentProvider('review', modelConfig)
+  const task = buildSpecialistTask(title, body, preCheckData, dimension)
+
+  const response: ChatResponse = await provider.chat([{ role: 'user', content: task }], {
+    temperature: 0.2,
+    maxTokens: 4000,
+    systemPrompt: prompt,
+  })
+
+  const text = response.content.filter((b) => b.type === 'text').map((b) => b.text ?? '').join('')
+  const result = parseDimensionResult(text, dimension)
+
+  console.log(`[ReviewAgent] ${name} score: ${result.score}/10`)
+  return result
+}
+
+// ============================================================
+// Synthesis (autoFix)
+// ============================================================
+
+async function runSynthesis(
+  title: string,
+  body: string,
+  dimensionResults: DimensionResult[],
+  preCheckIssues: string[],
+  modelConfig: ModelConfig,
+): Promise<{ fixedBody: string; writerBrief: WriterBrief }> {
+  const provider = createAgentProvider('review', modelConfig)
+
+  const synthesisInput = [
+    '## 文章标题\n' + title,
+    '\n## 文章正文\n' + body,
+    '\n## 预检问题\n' + preCheckIssues.map((i) => '- ' + i).join('\n'),
+    '\n## 专家评审结果',
+    ...dimensionResults.map(
+      (r) =>
+        `- **${r.dimension}** (${r.score}/10): ${r.reasoning}\n  问题: ${r.issues.join('; ')}\n  建议: ${r.suggestions.join('; ')}`,
+    ),
+  ].join('\n')
+
+  const response: ChatResponse = await provider.chat(
+    [{ role: 'user', content: synthesisInput + '\n\n请根据以上评审结果，生成修复后的文章和写作指南。输出格式要求：只返回 JSON，不要有任何其他文字。' }],
+    { temperature: 0.2, maxTokens: 8000, systemPrompt: SYNTHESIS_PROMPT },
+  )
+
+  const text = response.content.filter((b) => b.type === 'text').map((b) => b.text ?? '').join('')
+  const jsonStr = extractJsonFromResponse(text)
+
+  let parsed: { fixedBody: string; writerBrief: WriterBrief }
+  try {
+    parsed = JSON.parse(jsonStr) as { fixedBody: string; writerBrief: WriterBrief }
+  } catch (err) {
+    throw new Error(
+      `Synthesis failed: ${err instanceof Error ? err.message : String(err)}. ` + `Raw: ${jsonStr.slice(0, 300)}`,
+    )
+  }
+
+  return {
+    fixedBody: parsed.fixedBody ?? body,
+    writerBrief: parsed.writerBrief ?? { coreProblem: '评审未通过', mustFix: [], keepGood: [] },
+  }
+}
+
+// ============================================================
+// Main Agent (Lead Orchestrator)
+// ============================================================
+
+/**
+ * Run review agent with 4 parallel specialist reviewers.
+ *
+ * Architecture:
+ *   Lead (runReviewAgent) → 4 parallel AI calls
+ *     ├── perspective-reviewer  → evaluates viewpoint depth
+ *     ├── structure-reviewer   → evaluates article structure
+ *     ├── data-support-reviewer → evaluates data support
+ *     └── fluency-reviewer     → evaluates fluency
+ *
+ * Lead aggregates results and generates final ReviewResult.
+ */
 export async function runReviewAgent(
   title: string,
   body: string,
   modelConfig: ModelConfig,
   autoFix: boolean = true,
 ): Promise<ReviewResult> {
-  // Strip base64 images from body to avoid token limit overflow.
-  // Replace ![desc](data:image/jpeg;base64,...) with ![desc](image) for review.
-  const reviewBody = body
-    .replace(/!\[([^\]]*)\]\(data:image\/jpeg;base64,[^)]+\)/g, '![$1](image)')
-    .slice(0, 8000) // Truncate to 8000 chars to stay within token limits
+  // 1. Preprocess context
+  const reviewBody = stripBase64Images(body).slice(0, 8000)
+  const preCheck = runPreCheck(title, reviewBody)
+  const preCheckData = buildPreCheckData(reviewBody)
 
-  const provider = createAgentProvider('review', modelConfig)
-
-  const wordCount = countChineseWords(reviewBody)
-  const imagePlaceholders = reviewBody.match(/!\[.*?\]\(cover\)/g) ?? []
-  const imageCount = imagePlaceholders.length
-
-  // Dynamically extract company/brand/product entities from article text
-  const detectedCompanies = extractEntities(reviewBody)
-
-  // Count data/numbers
-  const numbers = reviewBody.match(/\d+(\.\d+)?[%亿万千万亿]?/g) ?? []
-  const dataPoints = numbers.slice(0, 20).join('、')
-
-  const preCheckData = [
-    '## 预检数据（仅供参考，请实际阅读正文判断）',
-    '字数：' + wordCount + ' 字',
-    '配图占位符：' + imageCount + ' 张',
-    '检测到的公司/品牌名：' + (detectedCompanies.length > 0 ? detectedCompanies.join('、') : '无'),
-    '检测到的数字/数据：' + (dataPoints || '无'),
-  ].join('\n')
-
-  const userPrompt =
-    REVIEW_SYSTEM_PROMPT +
-    '\n\n## 文章标题\n' +
-    title +
-    '\n\n## 文章正文\n' +
-    reviewBody +
-    '\n\n' +
-    preCheckData +
-    '\n\n请逐一阅读每个章节，严格按照评分标准打分，每项扣分都必须有具体位置和原因。\n输出格式要求：只返回 JSON，不要有任何其他文字。'
-
-  const response: ChatResponse = await provider.chat(
-    [{ role: 'user', content: userPrompt }],
-    { temperature: 0.2, maxTokens: 5000, systemPrompt: REVIEW_SYSTEM_PROMPT },
+  // 2. Run 4 specialist evaluations in parallel
+  const dimensionResults = await Promise.all(
+    SPECIALISTS.map((s) =>
+      evaluateDimension(s.dimension, s.name, s.prompt, title, reviewBody, preCheckData, modelConfig),
+    ),
   )
 
-  const text = response.content
-    .filter((b) => b.type === 'text')
-    .map((b) => b.text ?? '')
-    .join('')
-
-  // Extract JSON from markdown code block or raw JSON
-  let jsonStr = text.trim()
-  const codeBlockMatch = jsonStr.match(/```(?:json)?\s*\n?([\s\S]+?)\n?```/)
-  if (codeBlockMatch) {
-    jsonStr = codeBlockMatch[1]
-  }
-  const start = jsonStr.indexOf('{')
-  const end = jsonStr.lastIndexOf('}')
-
-  if (start === -1 || end === -1) {
-    throw new Error('ReviewAgent returned invalid JSON. Raw: ' + text.slice(0, 500))
+  // 3. Aggregate results
+  const dimensionScores: DimensionScores = {
+    perspective: dimensionResults.find((r) => r.dimension === 'perspective')?.score ?? 0,
+    structure: dimensionResults.find((r) => r.dimension === 'structure')?.score ?? 0,
+    dataSupport: dimensionResults.find((r) => r.dimension === 'dataSupport')?.score ?? 0,
+    fluency: dimensionResults.find((r) => r.dimension === 'fluency')?.score ?? 0,
   }
 
-  const parsed = JSON.parse(jsonStr.slice(start, end + 1)) as ReviewResult
+  const scores = Object.values(dimensionScores)
+  const totalScore = scores.reduce((a, b) => a + b, 0) / scores.length
+
+  const allIssues = [...preCheck.preCheckIssues, ...dimensionResults.flatMap((r) => r.issues)]
+  const allSuggestions = dimensionResults.flatMap((r) => r.suggestions)
+  const allReasoning = dimensionResults.map((r) => r.reasoning)
+
+  // 4. Handle autoFix if score < 7.0
+  if (totalScore < 7.0 && autoFix) {
+    const { fixedBody, writerBrief } = await runSynthesis(
+      title,
+      reviewBody,
+      dimensionResults,
+      preCheck.preCheckIssues,
+      modelConfig,
+    )
+
+    return {
+      score: totalScore,
+      passed: false,
+      dimensionScores,
+      reasoning: allReasoning,
+      issues: allIssues,
+      suggestions: allSuggestions,
+      fixedBody,
+      writerBrief,
+    }
+  }
 
   return {
-    score: parsed.score ?? 0,
-    passed: parsed.passed ?? (parsed.score ?? 0) >= 7.0,
-    dimensionScores: parsed.dimensionScores ?? {
-      perspective: 0,
-      structure: 0,
-      dataSupport: 0,
-      fluency: 0,
-    },
-    reasoning: parsed.reasoning ?? [],
-    issues: parsed.issues ?? [],
-    suggestions: parsed.suggestions ?? [],
-    fixedBody: parsed.fixedBody ?? undefined,
-    writerBrief: parsed.writerBrief ?? undefined,
+    score: totalScore,
+    passed: totalScore >= 7.0,
+    dimensionScores,
+    reasoning: allReasoning,
+    issues: allIssues,
+    suggestions: allSuggestions,
   }
-}
-
-function countChineseWords(text: string): number {
-  // Matches the implementation in writer.ts for consistency.
-  const chineseChars = text.match(/[\u4e00-\u9fff\u3400-\u4dbf]/g)?.length ?? 0
-  const englishWords = text.match(/[a-zA-Z]+/g)?.length ?? 0
-  const digitCount = text.match(/\d/g)?.length ?? 0
-  return chineseChars + englishWords + Math.ceil(digitCount * 0.5)
 }

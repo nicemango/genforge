@@ -1,8 +1,20 @@
+import { prisma } from '@/lib/prisma'
+import { parseWechatConfig, parseWritingStyle } from '@/lib/json'
+import { compileWechatArticle, type WechatLayoutConfig } from '@/lib/wechat-layout'
 import { pushToDraft, uploadImage } from '@/lib/wechat'
+import { renderTemplateImage } from '@/lib/template-image'
+import type { GeneratedImageAsset, ImagePlanItem } from '@/lib/image-plan'
 
 export interface PublishResult {
   mediaId: string
   publishedAt: string
+  contentId?: string
+  convertedHtml: string
+}
+
+export interface PublishOptions {
+  author?: string
+  contentId?: string
 }
 
 export async function runPublishAgent(
@@ -10,27 +22,121 @@ export async function runPublishAgent(
   title: string,
   body: string,
   summary?: string,
+  options?: PublishOptions,
 ): Promise<PublishResult> {
-  const htmlContent = await replaceImagesWithWechatUrls(accountId, body)
+  if (!title?.trim()) {
+    throw new Error('Article title is required for publishing')
+  }
+  if (!body?.trim()) {
+    throw new Error('Article body is required for publishing')
+  }
+
+  const account = await prisma.account.findUnique({
+    where: { id: accountId },
+    select: { wechatConfig: true, writingStyle: true },
+  })
+  if (!account) {
+    throw new Error(`Account ${accountId} not found`)
+  }
+
+  const wechatConfig = parseWechatConfig(account.wechatConfig)
+  const writingStyle = parseWritingStyle(account.writingStyle)
+  const layoutConfig: WechatLayoutConfig = {
+    themeId: wechatConfig.themeId,
+    brandName: wechatConfig.brandName ?? writingStyle.brandName,
+    primaryColor: wechatConfig.primaryColor,
+    accentColor: wechatConfig.accentColor,
+    titleAlign: wechatConfig.titleAlign,
+    showEndingCard: wechatConfig.showEndingCard,
+    endingCardText: wechatConfig.endingCardText,
+    imageStyle: wechatConfig.imageStyle,
+  }
+
+  const publishableBody = await ensurePublishableBody(accountId, body, layoutConfig, options?.contentId)
+  const themedHtml = compileWechatArticle(publishableBody, { title, summary, layoutConfig })
+  const htmlContent = await replaceImagesWithWechatUrls(accountId, themedHtml)
 
   const mediaId = await pushToDraft(accountId, {
     title,
     content: htmlContent,
     digest: summary,
+    author: options?.author,
   })
+
+  const publishedAt = new Date().toISOString()
+
+  if (options?.contentId) {
+    const content = await prisma.content.findUnique({ where: { id: options.contentId } })
+    if (content) {
+      const records = JSON.parse(content.publishRecords || '[]') as Array<Record<string, unknown>>
+      records.push({
+        mediaId,
+        publishedAt,
+        platform: 'wechat',
+        wordCount: content.wordCount,
+      })
+      await prisma.content.update({
+        where: { id: options.contentId },
+        data: { publishRecords: JSON.stringify(records) },
+      })
+    }
+  }
 
   return {
     mediaId,
-    publishedAt: new Date().toISOString(),
+    publishedAt,
+    contentId: options?.contentId,
+    convertedHtml: htmlContent,
   }
 }
 
-async function replaceImagesWithWechatUrls(accountId: string, markdown: string): Promise<string> {
-  const html = markdownToWechatHtml(markdown)
+async function ensurePublishableBody(
+  accountId: string,
+  body: string,
+  layoutConfig: WechatLayoutConfig,
+  contentId?: string,
+): Promise<string> {
+  if (!contentId || !body.includes('(data:image/')) {
+    return body
+  }
 
-  // Find all base64 images in the HTML
-  const base64Regex = /<img[^>]+src="data:image\/jpeg;base64,([^"]+)"[^>]*>/g
-  const matches = [...html.matchAll(base64Regex)]
+  const content = await prisma.content.findUnique({
+    where: { id: contentId },
+    select: { images: true },
+  })
+  const storedAssets = parseStoredAssets(content?.images ?? null)
+  if (storedAssets.length === 0) {
+    return body
+  }
+
+  let nextBody = body
+  const nextAssets: GeneratedImageAsset[] = []
+  for (const asset of storedAssets) {
+    let nextAsset = { ...asset }
+    if (isInlineAsset(nextAsset)) {
+      nextAsset = await upgradePublishAsset(accountId, nextAsset, layoutConfig)
+    }
+
+    nextAssets.push(nextAsset)
+    if (asset.url && nextAsset.url && asset.url !== nextAsset.url) {
+      nextBody = replaceMarkdownImageUrl(nextBody, asset, nextAsset.url)
+    }
+  }
+
+  await prisma.content.update({
+    where: { id: contentId },
+    data: {
+      body: nextBody,
+      images: JSON.stringify(nextAssets),
+    },
+  })
+
+  return nextBody
+}
+
+async function replaceImagesWithWechatUrls(accountId: string, html: string): Promise<string> {
+  const dataImageRegex = /src="(data:image\/[^";]+;base64,([^"]+))"/g
+  const matches = [...html.matchAll(dataImageRegex)]
 
   if (matches.length === 0) {
     return html
@@ -38,15 +144,79 @@ async function replaceImagesWithWechatUrls(accountId: string, markdown: string):
 
   let result = html
   for (const match of matches) {
-    const base64 = match[1]
+    const fullDataUrl = match[1]
+    const base64 = match[2]
     const wechatUrl = await uploadWithRetry(accountId, base64)
     if (wechatUrl) {
-      result = result.replace(`data:image/jpeg;base64,${base64}`, () => wechatUrl)
+      result = result.split(fullDataUrl).join(wechatUrl)
+    } else {
+      console.warn(`[PublishAgent] Image upload failed, base64 will be stripped from HTML (accountId: ${accountId}, size: ${base64.length} chars)`)
+      result = result.split(fullDataUrl).join('about:blank')
     }
-    // If wechatUrl is null, base64 stays in place (graceful degradation)
   }
 
   return result
+}
+
+async function upgradePublishAsset(
+  accountId: string,
+  asset: GeneratedImageAsset,
+  layoutConfig: WechatLayoutConfig,
+): Promise<GeneratedImageAsset> {
+  if (asset.imageBase64) {
+    const uploadedUrl = await uploadWithRetry(accountId, asset.imageBase64)
+    if (uploadedUrl) {
+      return {
+        ...asset,
+        url: uploadedUrl,
+        uploadStatus: 'uploaded',
+        qualityStatus: asset.qualityStatus === 'downgraded' ? 'downgraded' : 'passed',
+      }
+    }
+  }
+
+  const fallbackItem = buildTemplateFallbackItem(asset)
+  const rendered = await renderTemplateImage(fallbackItem, layoutConfig.themeId ?? 'wechat-pro')
+  const fallbackUrl = await uploadWithRetry(accountId, rendered.imageBase64)
+  if (!fallbackUrl) {
+    return {
+      ...asset,
+      uploadStatus: 'failed',
+      qualityStatus: 'failed',
+      fallbackReason: asset.fallbackReason ?? 'Publisher could not upload inline asset or template fallback',
+    }
+  }
+
+  return {
+    ...asset,
+    url: fallbackUrl,
+    mimeType: rendered.mimeType,
+    imageBase64: rendered.imageBase64,
+    renderMode: 'template',
+    coverMode: asset.imageType === 'cover-hero' ? 'template' : asset.coverMode,
+    uploadStatus: 'uploaded',
+    qualityStatus: 'downgraded',
+    fallbackReason: asset.fallbackReason ?? 'Publisher replaced inline image with template fallback',
+  }
+}
+
+function buildTemplateFallbackItem(asset: GeneratedImageAsset): ImagePlanItem {
+  return {
+    slotId: asset.slotId,
+    marker: asset.marker,
+    alt: asset.alt,
+    sectionTitle: asset.caption.split('｜')[0] || asset.alt,
+    imageType: asset.imageType === 'cover-hero' ? 'cover-hero' : asset.imageType === 'data-card' ? 'data-card' : 'section-card',
+    renderMode: 'template',
+    coverMode: asset.imageType === 'cover-hero' ? 'template' : asset.coverMode,
+    aspectRatio: asset.imageType === 'cover-hero' ? '16:9' : '4:3',
+    prompt:
+      asset.imageType === 'cover-hero'
+        ? `${asset.caption.split('｜')[0] || asset.alt}｜platform-cover｜平台规则与权限结构｜默认开关、授权面板、代码仓库与产品权限关系｜${asset.caption || asset.alt}`
+        : asset.sourcePrompt || `${asset.alt}｜${asset.caption || '模板降级卡片'}`,
+    caption: asset.caption || `${asset.alt}｜模板降级`,
+    priority: 0,
+  }
 }
 
 async function uploadWithRetry(accountId: string, base64: string, maxRetries = 3): Promise<string | null> {
@@ -57,7 +227,6 @@ async function uploadWithRetry(accountId: string, base64: string, maxRetries = 3
     } catch (err) {
       lastError = err instanceof Error ? err : new Error(String(err))
       if (attempt < maxRetries) {
-        // Exponential backoff: 1s, 2s
         await sleep(attempt * 1000)
       }
     }
@@ -70,236 +239,32 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
-function markdownToWechatHtml(markdown: string): string {
-  // Normalize line endings
-  let html = markdown.replace(/\r\n/g, '\n').trim()
-
-  // Preserve image tags — must be done BEFORE any inline tag processing
-  // Match both standard markdown images and data-uri images
-  // Also handle unresolved cover placeholders: ![alt](cover) -> empty span (no image available)
-  const imagePlaceholders: string[] = []
-  html = html.replace(/!\[([^\]]*)\]\((data:image[^)]+)\)/g, (_match, alt, src) => {
-    const placeholder = `__IMG_${imagePlaceholders.length}__`
-    imagePlaceholders.push(`<img src="${src}" alt="${alt}" style="max-width:100%;display:block;margin:16px 0;" />`)
-    return placeholder
-  })
-
-  // Remove unresolved cover placeholders — they mean no image was generated
-  html = html.replace(/!\[([^\]]*)\]\(cover\)/g, '')
-
-  // Process line by line: identify block types first, then wrap
-  const lines = html.split('\n')
-  const outputBlocks: string[] = []
-  let i = 0
-
-  while (i < lines.length) {
-    const line = lines[i]
-    const trimmed = line.trim()
-
-    // Skip empty lines
-    if (!trimmed) {
-      i++
-      continue
-    }
-
-    // H1 heading
-    if (trimmed.startsWith('# ')) {
-      outputBlocks.push(`<h1>${inlineFormat(trimmed.slice(2).trim())}</h1>`)
-      i++
-      continue
-    }
-
-    // H2 heading (most article sections use H2)
-    if (trimmed.startsWith('## ')) {
-      outputBlocks.push(`<h2>${inlineFormat(trimmed.slice(3).trim())}</h2>`)
-      i++
-      continue
-    }
-
-    // H3 heading
-    if (trimmed.startsWith('### ')) {
-      outputBlocks.push(`<h3>${inlineFormat(trimmed.slice(4).trim())}</h3>`)
-      i++
-      continue
-    }
-
-    // Blockquote
-    if (trimmed.startsWith('> ')) {
-      const quoteLines: string[] = []
-      while (i < lines.length && lines[i].trim().startsWith('> ')) {
-        quoteLines.push(lines[i].trim().slice(2))
-        i++
-      }
-      const quoteText = quoteLines.join(' ')
-      outputBlocks.push(`<blockquote><p>${inlineFormat(quoteText)}</p></blockquote>`)
-      continue
-    }
-
-    // Unordered list — collect consecutive lines, support nesting via indentation
-    if (/^[-*]\s/.test(trimmed)) {
-      outputBlocks.push(parseNestedList(lines, i, 'ul'))
-      // Advance past all list lines (including nested)
-      while (i < lines.length && /^(\s*)[-*]\s/.test(lines[i]) && lines[i].trim()) {
-        i++
-      }
-      continue
-    }
-
-    // Ordered list — collect consecutive numbered lines, support nesting
-    if (/^\d+\.\s/.test(trimmed)) {
-      outputBlocks.push(parseNestedList(lines, i, 'ol'))
-      while (i < lines.length && /^(\s*)\d+\.\s/.test(lines[i]) && lines[i].trim()) {
-        i++
-      }
-      continue
-    }
-
-    // Horizontal rule
-    if (trimmed === '---' || trimmed === '***' || trimmed === '___') {
-      outputBlocks.push('<hr style="border:none;border-top:1px solid #eee;margin:24px 0;" />')
-      i++
-      continue
-    }
-
-    // Image placeholder (from earlier replacement)
-    if (trimmed.startsWith('__IMG_')) {
-      const imgIdx = parseInt(trimmed.slice(6), 10)
-      if (imgIdx < 0 || imgIdx >= imagePlaceholders.length) {
-        throw new Error(`Image placeholder index ${imgIdx} out of bounds (total images: ${imagePlaceholders.length})`)
-      }
-      outputBlocks.push(imagePlaceholders[imgIdx])
-      i++
-      continue
-    }
-
-    // Paragraph: collect consecutive non-blank, non-tag lines
-    const paraLines: string[] = []
-    while (
-      i < lines.length &&
-      lines[i].trim() &&
-      !lines[i].trim().startsWith('#') &&
-      !lines[i].trim().startsWith('- ') &&
-      !lines[i].trim().startsWith('* ') &&
-      !lines[i].trim().startsWith('> ') &&
-      !/^\d+\.\s/.test(lines[i].trim()) &&
-      !lines[i].trim().startsWith('__IMG_') &&
-      lines[i].trim() !== '---' &&
-      lines[i].trim() !== '***' &&
-      lines[i].trim() !== '___'
-    ) {
-      const t = lines[i].trim()
-      if (!t.startsWith('__IMG_')) {
-        paraLines.push(t)
-      }
-      i++
-    }
-    if (paraLines.length > 0) {
-      // Join with <br> for line breaks within paragraph, then inline format
-      const joined = paraLines.join('<br>')
-      outputBlocks.push(`<p>${inlineFormat(joined)}</p>`)
-    }
+function parseStoredAssets(imagesJson: string | null): GeneratedImageAsset[] {
+  if (!imagesJson) return []
+  try {
+    const parsed = JSON.parse(imagesJson)
+    return Array.isArray(parsed) ? (parsed as GeneratedImageAsset[]) : []
+  } catch {
+    return []
   }
-
-  return outputBlocks.join('\n')
 }
 
-// Parse nested lists by tracking indentation levels
-function parseNestedList(lines: string[], startIdx: number, rootTag: 'ul' | 'ol'): string {
-  const isListLine = (line: string): boolean => {
-    const t = line.trimStart()
-    return rootTag === 'ul' ? /^[-*]\s/.test(t) : /^\d+\.\s/.test(t)
-  }
-
-  const getIndent = (line: string): number => line.length - line.trimStart().length
-  const getContent = (line: string): string => {
-    const t = line.trimStart()
-    return rootTag === 'ul' ? t.slice(2) : t.replace(/^\d+\.\s/, '')
-  }
-
-  const parts: string[] = []
-  const indentStack: number[] = []
-  let i = startIdx
-
-  parts.push(`<${rootTag}>`)
-  indentStack.push(getIndent(lines[startIdx]))
-
-  while (i < lines.length && lines[i].trim() && isListLine(lines[i])) {
-    const indent = getIndent(lines[i])
-    const currentLevel = indentStack[indentStack.length - 1]
-
-    if (indent > currentLevel) {
-      // Open nested list
-      parts.push(`<${rootTag}>`)
-      indentStack.push(indent)
-    } else {
-      while (indentStack.length > 1 && indent < indentStack[indentStack.length - 1]) {
-        // Close nested list(s)
-        parts.push(`</li></${rootTag}>`)
-        indentStack.pop()
-      }
-    }
-
-    parts.push(`<li>${inlineFormat(getContent(lines[i]))}`)
-    // Check if next line is deeper (will open sub-list), if not close li
-    const nextIdx = i + 1
-    if (nextIdx >= lines.length || !lines[nextIdx].trim() || !isListLine(lines[nextIdx]) || getIndent(lines[nextIdx]) <= indent) {
-      parts.push('</li>')
-    }
-
-    i++
-  }
-
-  // Close remaining open tags
-  while (indentStack.length > 0) {
-    if (indentStack.length > 1) {
-      parts.push(`</${rootTag}>`)
-    }
-    indentStack.pop()
-  }
-  parts.push(`</${rootTag}>`)
-
-  return parts.join('')
+function isInlineAsset(asset: GeneratedImageAsset): boolean {
+  return !asset.url || asset.url.startsWith('data:image/') || asset.uploadStatus === 'inline'
 }
 
-// Apply inline formatting: bold, italic, links, code
-function inlineFormat(text: string): string {
-  if (!text) return text
+function replaceMarkdownImageUrl(body: string, asset: GeneratedImageAsset, nextUrl: string): string {
+  const currentUrl = asset.url ?? ''
+  const exact = currentUrl ? `![${asset.alt}](${currentUrl})` : ''
+  if (exact && body.includes(exact)) {
+    return body.replace(exact, `![${asset.alt}](${nextUrl})`)
+  }
 
-  // Restore image placeholders within paragraphs
-  text = text.replace(/__IMG_(\d+)__/g, (_, idx) => `__IMG_${idx}__`)
+  if (!currentUrl) return body
+  const pattern = new RegExp(`!\\[([^\\]]*)\\]\\(${escapeRegExp(currentUrl)}\\)`, 'g')
+  return body.replace(pattern, (_match, alt: string) => `![${alt || asset.alt}](${nextUrl})`)
+}
 
-  // Extract links first to protect URLs from bold/italic regex matching * in URLs
-  const linkPlaceholders: string[] = []
-  // Markdown links: [text](url)
-  text = text.replace(/\[(.+?)\]\((https?:\/\/[^)]+)\)/g, (_, linkText, url) => {
-    const placeholder = `__LINK_${linkPlaceholders.length}__`
-    linkPlaceholders.push(`<a href="${url}">${linkText}</a>`)
-    return placeholder
-  })
-  // Relative URL links
-  text = text.replace(/\[(.+?)\]\((?!https?:\/\/)([^)]+)\)/g, (_, linkText) => {
-    const placeholder = `__LINK_${linkPlaceholders.length}__`
-    linkPlaceholders.push(`<span>${linkText}</span>`)
-    return placeholder
-  })
-
-  // Code inline: `code`
-  text = text.replace(/`([^`]+)`/g, '<code style="background:#f5f5f5;padding:2px 6px;border-radius:3px;font-size:0.9em;">$1</code>')
-
-  // Bold: **text**
-  text = text.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
-
-  // Italic: *text*
-  text = text.replace(/\*(.+?)\*/g, '<em>$1</em>')
-
-  // Restore link placeholders
-  text = text.replace(/__LINK_(\d+)__/g, (_, idx) => {
-    const index = parseInt(idx, 10)
-    if (index < 0 || index >= linkPlaceholders.length) {
-      throw new Error(`Link placeholder index ${index} out of bounds (total: ${linkPlaceholders.length})`)
-    }
-    return linkPlaceholders[index]
-  })
-
-  return text
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 }

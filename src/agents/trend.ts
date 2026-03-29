@@ -1,4 +1,6 @@
 import { createFetchRssTool } from "@/tools/fetch-rss";
+import { createFetchGitHubTrendingTool } from "@/tools/fetch-github-trending";
+import { createFetchTwitterTool } from "@/tools/fetch-twitter";
 import {
   DEFAULT_TOPIC,
   getTopicConfig,
@@ -7,6 +9,8 @@ import {
   RSS_SOURCES,
   type RssSource,
 } from "@/lib/rss-sources";
+import { DEFAULT_GITHUB_SOURCES, type GitHubSource } from "@/lib/github-sources";
+import { DEFAULT_TWITTER_SOURCES, type TwitterSource } from "@/lib/twitter-sources";
 import { loadTrendConfig, type TrendAgentConfig } from "@/lib/trend-config";
 import { AIClient } from "@/lib/providers/client-wrapper";
 import { createWebFetchTool } from "@/tools/web-fetch";
@@ -56,15 +60,25 @@ export interface TrendResult {
   stats: TrendStats;
 }
 
-/** 单次抓取超时时间（毫秒） */
-const FETCH_TIMEOUT_MS = 10_000;
 /** 最大重试次数（包含首轮） */
 const MAX_RETRIES = 3;
 
 /**
+ * Progress callback for real-time trend crawling updates.
+ */
+export type TrendProgressCallback = (info: {
+  phase: string
+  current: number
+  total: number
+  sourceName?: string
+  latestItem?: string
+  stats?: Partial<TrendStats>
+}) => void
+
+/**
  * 运行趋势代理主流程
  * 1. 根据配置获取话题 RSS 源子集与关键词配置
- * 2. 并发抓取（Promise.allSettled，避免个别失败阻塞整体）
+ * 2. 顺序抓取（提供实时进度）；无 onProgress 时退化为并发抓取
  * 3. 去重（按链接）、过滤近 N 天、按主题关键词过滤
  * 4. 返回结果与统计
  *
@@ -75,7 +89,10 @@ const MAX_RETRIES = 3;
  *   4. src/config/trend-agent.json
  *   5. 代码默认值
  */
-export async function runTrendAgent(agentConfig?: Partial<TrendAgentConfig['agent']>): Promise<TrendResult> {
+export async function runTrendAgent(
+  agentConfig?: Partial<TrendAgentConfig['agent']>,
+  onProgress?: TrendProgressCallback,
+): Promise<TrendResult> {
   const baseConfig = loadTrendConfig()
   const cfg = {
     agent: {
@@ -101,28 +118,63 @@ export async function runTrendAgent(agentConfig?: Partial<TrendAgentConfig['agen
     topicFiltered: 0,
   }
 
-  const results = await Promise.allSettled(
-    sources.map(async (source) => {
-      return fetchWithRetry(fetchTool, source.url, source.name, 0)
-    }),
-  )
+  // Fetch RSS sources
+  const results: PromiseSettledResult<FetchStatus>[] = []
+
+  if (onProgress) {
+    // Sequential with progress reporting
+    for (let i = 0; i < sources.length; i++) {
+      const source = sources[i]
+      const r = await fetchWithRetry(fetchTool, source.url, source.name, 0)
+      results.push({ status: 'fulfilled', value: r })
+      if (r.status === 'success') stats.success++
+      else if (r.status === 'timeout') stats.timedOut++
+      else stats.failed++
+      onProgress({
+        phase: 'crawling',
+        current: i + 1,
+        total: sources.length,
+        sourceName: source.name,
+        latestItem: r.status === 'success' && r.items[0] ? r.items[0].title : undefined,
+        stats: { ...stats },
+      })
+    }
+  } else {
+    // Parallel (fast, no progress)
+    results.push(
+      ...(await Promise.allSettled(
+        sources.map(async (source) => {
+          return fetchWithRetry(fetchTool, source.url, source.name, 0)
+        }),
+      )),
+    )
+  }
 
   const items: TrendItem[] = []
   for (const r of results) {
     if (r.status === "fulfilled") {
       const result = r.value
       if (result.status === "success") {
-        stats.success++
+        // stats already updated inline for sequential path; only update here for parallel path
+        if (!onProgress) stats.success++
         items.push(...result.items)
       } else if (result.status === "timeout") {
-        stats.timedOut++
+        if (!onProgress) stats.timedOut++
       } else {
-        stats.failed++
+        if (!onProgress) stats.failed++
       }
     } else {
-      stats.failed++
+      if (!onProgress) stats.failed++
     }
   }
+
+  // Fetch GitHub trending (non-blocking - failures don't halt pipeline)
+  const githubItems = await fetchGitHubTrending(DEFAULT_GITHUB_SOURCES)
+  items.push(...githubItems)
+
+  // Fetch Twitter tweets (non-blocking - failures don't halt pipeline)
+  const twitterItems = await fetchTwitter(DEFAULT_TWITTER_SOURCES)
+  items.push(...twitterItems)
 
   const deduplicated = deduplicateByUrl(items)
   const fresh = filterRecentItems(deduplicated, cfg.agent.freshDays)
@@ -138,6 +190,111 @@ export async function runTrendAgent(agentConfig?: Partial<TrendAgentConfig['agen
     fetchedAt: new Date().toISOString(),
     stats,
   }
+}
+
+/**
+ * Fetch GitHub trending repositories
+ * Non-blocking: returns empty array on failure
+ */
+async function fetchGitHubTrending(sources: GitHubSource[]): Promise<TrendItem[]> {
+  const tool = createFetchGitHubTrendingTool()
+  const items: TrendItem[] = []
+
+  const results = await Promise.allSettled(
+    sources.map(async (source) => {
+      const result = await tool.execute({
+        sourceName: source.name,
+        query: source.query,
+        sort: source.sort ?? 'stars',
+        language: source.language,
+        daily: source.daily,
+        limit: 20,
+      })
+      if (!result.success) {
+        console.warn(`[TrendAgent] GitHub trending fetch failed for ${source.name}: ${result.error}`)
+        return []
+      }
+
+      const data = JSON.parse(result.output) as {
+        repos: Array<{
+          name: string
+          fullName: string
+          description: string
+          stars: number
+          language: string | null
+          url: string
+        }>
+      }
+
+      return data.repos.map((repo) => ({
+        title: `${repo.fullName} ⭐ ${repo.stars}`,
+        link: repo.url,
+        pubDate: new Date().toISOString(),
+        snippet: `${repo.description || '(no description)'} | Language: ${repo.language ?? 'N/A'}`,
+        source: `GitHub: ${source.name}`,
+      })) as TrendItem[]
+    }),
+  )
+
+  for (const r of results) {
+    if (r.status === 'fulfilled' && Array.isArray(r.value)) {
+      items.push(...r.value)
+    }
+  }
+
+  return items
+}
+
+/**
+ * Fetch tweets from Twitter accounts
+ * Non-blocking: returns empty array on failure
+ */
+async function fetchTwitter(sources: TwitterSource[]): Promise<TrendItem[]> {
+  const tool = createFetchTwitterTool()
+  const items: TrendItem[] = []
+
+  const results = await Promise.allSettled(
+    sources.map(async (source) => {
+      const result = await tool.execute({
+        sourceName: source.name,
+        handle: source.handle,
+        minLikes: source.minLikes ?? 100,
+        limit: 20,
+      })
+      if (!result.success) {
+        console.warn(`[TrendAgent] Twitter fetch failed for @${source.handle}: ${result.error}`)
+        return []
+      }
+
+      const data = JSON.parse(result.output) as {
+        tweets: Array<{
+          id: string
+          text: string
+          likes: number
+          permalink: string
+          createdAt: string
+          isRetweet: boolean
+          isReply: boolean
+        }>
+      }
+
+      return data.tweets.map((tweet) => ({
+        title: tweet.text.slice(0, 100) + (tweet.text.length > 100 ? '...' : ''),
+        link: tweet.permalink,
+        pubDate: tweet.createdAt,
+        snippet: `${tweet.text} | ❤️ ${tweet.likes}${tweet.isRetweet ? ' | RT' : ''}${tweet.isReply ? ' | Reply' : ''}`,
+        source: `Twitter: ${source.name}`,
+      })) as TrendItem[]
+    }),
+  )
+
+  for (const r of results) {
+    if (r.status === 'fulfilled' && Array.isArray(r.value)) {
+      items.push(...r.value)
+    }
+  }
+
+  return items
 }
 
 type FetchStatus =
@@ -157,11 +314,7 @@ async function fetchWithRetry(
   attempt: number,
 ): Promise<FetchStatus> {
   try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
-
     const result = await fetchTool.execute({ url, limit: 20 });
-    clearTimeout(timeout);
 
     if (!result.success) {
       if (attempt < MAX_RETRIES - 1) {
@@ -188,7 +341,7 @@ async function fetchWithRetry(
         title: a.title,
         link: a.link,
         pubDate: a.pubDate,
-        snippet: a.snippet,
+        snippet: a.snippet?.trim() || a.title,
         source: sourceName,
       }),
     );
