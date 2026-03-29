@@ -14,6 +14,19 @@ export interface PipelineInput {
 
 export interface PipelineStepInput extends PipelineInput {
   step: TaskType
+  /** Parent TaskRun ID (set when this step is run as part of a FULL_PIPELINE) */
+  parentRunId?: string
+  /** Progress callback for real-time updates during step execution */
+  onProgress?: (info: StepProgressInfo) => void
+  /** Number of write attempts so far (passed to REVIEW so QualityRecord is accurate) */
+  writeAttempts?: number
+}
+
+export interface StepProgressInfo {
+  phase: string
+  current: number
+  total: number
+  message?: string
 }
 
 export interface PipelineOutput {

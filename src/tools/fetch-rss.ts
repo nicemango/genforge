@@ -1,5 +1,7 @@
 import { z } from 'zod'
 import { XMLParser } from 'fast-xml-parser'
+import * as https from 'https'
+import * as http from 'http'
 import { HttpsProxyAgent } from 'https-proxy-agent'
 import type { Tool, ToolResult } from './types'
 
@@ -25,25 +27,64 @@ interface FetchRssToolOptions {
 // XML parser — shared across all execute() calls, no per-request re-creation
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
-// Proxy agent — reads HTTP_PROXY / HTTPS_PROXY once, memoised
+// Proxy agent — reads HTTP_PROXY / HTTPS_PROXY at call time
 // ---------------------------------------------------------------------------
-let _proxyAgent: HttpsProxyAgent<string> | null = null
 
-function getProxyAgent(): HttpsProxyAgent<string> | null {
-  if (_proxyAgent) return _proxyAgent
-  const proxyUrl =
-    process.env.HTTPS_PROXY ||
-    process.env.https_proxy ||
-    process.env.HTTP_PROXY ||
-    process.env.http_proxy ||
-    ''
-  if (!proxyUrl) return null
-  try {
-    _proxyAgent = new HttpsProxyAgent(proxyUrl)
-    return _proxyAgent
-  } catch {
-    return null
-  }
+function getProxyUrl(): string | undefined {
+  return process.env.HTTPS_PROXY || process.env.https_proxy || process.env.HTTP_PROXY || process.env.http_proxy
+}
+
+function fetchUrl(
+  urlStr: string,
+  timeoutMs: number,
+  redirectCount = 0,
+): Promise<{ ok: boolean; status: number; body: string }> {
+  return new Promise((resolve) => {
+    const isHttps = urlStr.startsWith('https://')
+    const url = new URL(urlStr)
+    const proxyUrl = getProxyUrl()
+    const agent = proxyUrl
+      ? new HttpsProxyAgent(proxyUrl)
+      : isHttps
+        ? https.globalAgent
+        : http.globalAgent
+
+    const options = {
+      hostname: url.hostname,
+      port: url.port || (isHttps ? 443 : 80),
+      path: url.pathname + url.search,
+      method: 'GET',
+      agent,
+      timeout: timeoutMs,
+      headers: {
+        'User-Agent': 'Content-Center/1.0 RSS Reader',
+        'Accept': 'application/rss+xml, application/xml, text/xml, application/atom+xml, */*',
+      },
+    }
+
+    const req = (isHttps ? https : http).request(options, (res) => {
+      const status = res.statusCode ?? 0
+      const location = res.headers.location
+      if (
+        status >= 300 &&
+        status < 400 &&
+        location &&
+        redirectCount < 5
+      ) {
+        const nextUrl = new URL(location, urlStr).toString()
+        res.resume()
+        void fetchUrl(nextUrl, timeoutMs, redirectCount + 1).then(resolve)
+        return
+      }
+
+      let data = ''
+      res.on('data', (chunk) => data += chunk)
+      res.on('end', () => resolve({ ok: status >= 200 && status < 300, status, body: data }))
+    })
+    req.on('error', () => resolve({ ok: false, status: 0, body: '' }))
+    req.on('timeout', () => { req.destroy(); resolve({ ok: false, status: 0, body: '' }) })
+    req.end()
+  })
 }
 
 // ---------------------------------------------------------------------------
@@ -52,6 +93,7 @@ function getProxyAgent(): HttpsProxyAgent<string> | null {
 const xmlParser = new XMLParser({
   parseAttributeValue: false,
   ignoreAttributes: true,
+  processEntities: false,
   // Preserve text trimming via postprocessing
   trimValues: true,
 })
@@ -214,30 +256,14 @@ export function createFetchRssTool(opts: FetchRssToolOptions = {}): Tool {
         }
       }
 
-      let controller: AbortController
-      let timeoutId: ReturnType<typeof setTimeout> | undefined
-
       try {
-        controller = new AbortController()
-        timeoutId = setTimeout(() => controller.abort(), timeoutMs)
+        const res = await fetchUrl(feedUrl, timeoutMs)
 
-        const response = await fetch(feedUrl, {
-          signal: controller.signal,
-          headers: {
-            'User-Agent': 'Content-Center/1.0 RSS Reader',
-            'Accept': 'application/rss+xml, application/xml, text/xml, application/atom+xml, */*',
-          },
-          // @ts-expect-error — https-proxy-agent is compatible with http(s) fetch agent option
-          agent: getProxyAgent(),
-        })
-
-        clearTimeout(timeoutId)
-
-        if (!response.ok) {
-          return { success: false, output: '', error: `HTTP ${response.status} ${response.statusText} for ${feedUrl}` }
+        if (!res.ok) {
+          return { success: false, output: '', error: `HTTP ${res.status} for ${feedUrl}` }
         }
 
-        const xmlText = await response.text()
+        const xmlText = res.body
         const { feedTitle, articles } = parseXmlFeed(xmlText, effectiveLimit)
 
         return {
@@ -245,11 +271,7 @@ export function createFetchRssTool(opts: FetchRssToolOptions = {}): Tool {
           output: JSON.stringify({ feedTitle: feedTitle || feedUrl, articles }, null, 2),
         }
       } catch (err) {
-        clearTimeout(timeoutId)
         if (err instanceof Error) {
-          if (err.name === 'AbortError') {
-            return { success: false, output: '', error: `Timeout after ${timeoutMs}ms fetching ${feedUrl}` }
-          }
           return { success: false, output: '', error: `Failed to fetch RSS ${feedUrl}: ${err.message}` }
         }
         return { success: false, output: '', error: `Failed to fetch RSS ${feedUrl}: ${String(err)}` }

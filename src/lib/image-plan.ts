@@ -66,6 +66,7 @@ interface SectionContext {
 }
 
 interface ParagraphContext {
+  slotId?: string
   sectionTitle: string
   text: string
 }
@@ -117,7 +118,9 @@ export function planArticleImages(
           title: `章节 ${sectionIndex}`,
           content: articleBody,
         }
-    const strategy = inferSectionStrategy(context)
+    const strategy = slot.slotId.startsWith('para-')
+      ? inferParagraphStrategy(context)
+      : inferSectionStrategy(context)
 
     items.push({
       slotId: slot.slotId,
@@ -300,6 +303,23 @@ function inferSectionStrategy(context: SectionContext): { imageType: ImageType; 
   return { imageType: 'section-illustration', renderMode: 'ai' }
 }
 
+function inferParagraphStrategy(context: SectionContext): { imageType: ImageType; renderMode: RenderMode } {
+  const text = context.content
+  const blockquoteCount = (text.match(/(^|\n)>\s+/g) ?? []).length
+  const listCount = (text.match(/(^|\n)(?:- |\* |\d+\. )/g) ?? []).length
+  const signalCount = DATA_SIGNALS.filter((signal) => text.includes(signal) || context.title.includes(signal)).length
+  const textLength = cleanInlineText(text).length
+  const explicitStructureSignal = /(第一|第二|第三|第[一二三四五六七八九十]层|分为|可以分成|结构如下|关键事实如下|具体包括|路径如下|步骤如下|有三点|有两个)/.test(text)
+
+  if (blockquoteCount > 0 && textLength < 120) {
+    return { imageType: 'quote-card', renderMode: 'template' }
+  }
+  if (listCount >= 2 || explicitStructureSignal || (listCount >= 1 && signalCount >= 3 && textLength < 180)) {
+    return { imageType: 'data-card', renderMode: 'template' }
+  }
+  return { imageType: 'section-illustration', renderMode: 'ai' }
+}
+
 function extractImageSlots(articleBody: string): Array<{ slotId: string; marker: string; alt: string }> {
   const matches = [...articleBody.matchAll(/!\[([^\]]*)\]\(image:(cover|section-\d+|para-\d+)\)/g)]
   return matches.map((match) => ({
@@ -338,20 +358,18 @@ function extractParagraphContexts(articleBody: string): ParagraphContext[] {
       .map((block) => block.trim())
       .filter(Boolean)
       .filter((block) => !/^##\s+/.test(block))
-      .filter((block) => !/^!\[[^\]]*\]\(image:/.test(block))
-
-    const ranked = blocks
-      .map((block) => ({
-        text: cleanInlineText(block),
-        score: scoreParagraphContext(block),
-      }))
-      .filter((item) => item.text.length >= 24)
-      .sort((a, b) => b.score - a.score)
-
-    if (ranked[0]) {
+    for (let index = 0; index < blocks.length; index += 1) {
+      const block = blocks[index]
+      const slotMatch = block.match(/^!\[[^\]]*\]\(image:(para-\d+)\)$/)
+      if (!slotMatch) continue
+      const previous = findNarrativeBlock(blocks, index - 1, -1)
+      const next = findNarrativeBlock(blocks, index + 1, 1)
+      const text = cleanInlineText(previous || next || '')
+      if (text.length < 24) continue
       paragraphs.push({
+        slotId: slotMatch[1],
         sectionTitle,
-        text: ranked[0].text,
+        text,
       })
     }
   }
@@ -376,8 +394,7 @@ function resolveParagraphContext(
   sections: SectionContext[],
   articleBody: string,
 ): SectionContext {
-  const index = getParagraphIndexFromSlot(slotId)
-  const paragraph = paragraphs[index - 1]
+  const paragraph = paragraphs.find((item) => item.slotId === slotId)
   if (paragraph) {
     return {
       title: paragraph.sectionTitle,
@@ -385,7 +402,19 @@ function resolveParagraphContext(
     }
   }
 
+  const index = getParagraphIndexFromSlot(slotId)
   return sections[index - 1] ?? sections[0] ?? { title: `段落 ${index}`, content: articleBody }
+}
+
+function findNarrativeBlock(blocks: string[], startIndex: number, step: -1 | 1): string | undefined {
+  for (let index = startIndex; index >= 0 && index < blocks.length; index += step) {
+    const block = blocks[index]?.trim()
+    if (!block) continue
+    if (/^!\[[^\]]*\]\(image:/.test(block)) continue
+    if (/^>\s?/.test(block)) continue
+    return block
+  }
+  return undefined
 }
 
 function cleanInlineText(text: string): string {
@@ -590,12 +619,12 @@ function inferCoverStrategy(
   articleVisualCategory: ArticleVisualCategory,
 ): { renderMode: RenderMode; coverMode: CoverMode } {
   if (articleVisualCategory === 'platform-event') {
-    return { renderMode: 'template', coverMode: 'semi-template' }
+    return { renderMode: 'ai', coverMode: 'ai' }
   }
 
   const normalized = `${articleTitle} ${context}`.toLowerCase()
   if (/(协议|默认同意|权限|开关|平台|规则|仓库|开发者|copilot|github|openai|meta)/.test(normalized)) {
-    return { renderMode: 'template', coverMode: 'semi-template' }
+    return { renderMode: 'ai', coverMode: 'ai' }
   }
 
   return { renderMode: 'ai', coverMode: 'ai' }

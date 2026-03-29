@@ -45,6 +45,14 @@ const WritingStyleSchema = z.object({
 const WechatConfigSchema = z.object({
   appId: z.string(),
   appSecret: z.string(),
+  themeId: z.enum(['brand-clean', 'brand-magazine', 'brand-warm', 'wechat-pro']).optional(),
+  brandName: z.string().optional(),
+  primaryColor: z.string().optional(),
+  accentColor: z.string().optional(),
+  titleAlign: z.enum(['left', 'center']).optional(),
+  showEndingCard: z.boolean().optional(),
+  endingCardText: z.string().optional(),
+  imageStyle: z.enum(['rounded', 'soft-shadow', 'square']).optional(),
 })
 
 // 单环节质量门槛

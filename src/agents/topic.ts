@@ -339,6 +339,92 @@ function sanitizeTopicSummary(summary: string): string {
     .trim()
 }
 
+function hasUnsupportedHardNumber(text: string): boolean {
+  if (!text) return false
+
+  const strongNumericClaim =
+    /\b\d+(?:\.\d+)?%|\b\d+(?:\.\d+)?亿|\b\d+(?:\.\d+)?万|\b\d+(?:\.\d+)?倍|几乎所有人|所有公司都|全部开发者都/
+
+  if (!strongNumericClaim.test(text)) return false
+  if (/来源[:：]|https?:\/\//.test(text)) return false
+  if (/GitHub|OpenAI|微软|Meta|Google|苹果|英伟达|Anthropic|DeepSeek|Copilot/i.test(text)) {
+    return /\b\d+(?:\.\d+)?(?:亿|万|倍|%)|\bL\d/.test(text)
+  }
+
+  return true
+}
+
+function getSourceHost(url: string): string {
+  try {
+    return new URL(url).hostname.toLowerCase()
+  } catch {
+    return ''
+  }
+}
+
+function computeDataReadinessScore(
+  title: string,
+  summary: string,
+  sources: Array<{ title: string; url: string; source: string }>,
+): number {
+  let score = 0
+
+  for (const source of sources) {
+    const host = getSourceHost(source.url)
+    if (!host) continue
+    if (/github\.com$|arxiv\.org$|openai\.com$|docs\.|developer\.|research\.|github\.blog$|huggingface\.co$|huggingface\.com$/.test(host)) {
+      score += 3
+      continue
+    }
+    if (/36kr\.com$|leiphone\.com$|ifanr\.com$|techcrunch\.com$|theverge\.com$|economist\.com$|huxiu\.com$|geekpark\.net$/.test(host)) {
+      score += 1
+    }
+  }
+
+  const combined = `${title} ${summary}`
+  if (/官方|文档|docs|blog|GitHub|论文|paper|benchmark|评测|报告|数据|repo|许可证|条款|policy|研究/.test(combined)) score += 2
+  if (/\d/.test(combined)) score += 1
+  return score
+}
+
+export type PublishabilityTier = 'high-evidence' | 'policy-doc' | 'opinion-led'
+
+export function inferPublishabilityTier(
+  title: string,
+  summary: string,
+  sources: Array<{ title: string; url: string; source: string }>,
+): PublishabilityTier {
+  const combined = `${title} ${summary} ${sources.map((s) => s.title).join(' ')}`
+  const hasHighEvidenceSource = sources.some((source) => {
+    const host = getSourceHost(source.url)
+    return /github\.com$|arxiv\.org$|openai\.com$|huggingface\.co$|huggingface\.com$|docs\.|developer\.|research\.|github\.blog$/.test(host)
+  })
+
+  if (hasHighEvidenceSource || /论文|paper|benchmark|评测|报告|report|dataset|实验|docs|文档|官方博文|repo/i.test(combined)) {
+    return 'high-evidence'
+  }
+  if (/条款|政策|privacy|policy|settings|许可|授权|opt-out|开源协议|docs|文档/i.test(combined)) {
+    return 'policy-doc'
+  }
+  return 'opinion-led'
+}
+
+function publishabilityPriority(
+  title: string,
+  summary: string,
+  sources: Array<{ title: string; url: string; source: string }>,
+): number {
+  const tier = inferPublishabilityTier(title, summary, sources)
+  switch (tier) {
+    case 'high-evidence':
+      return 3
+    case 'policy-doc':
+      return 2
+    default:
+      return 1
+  }
+}
+
 function validateTopic(topic: unknown, index: number): TopicSuggestion {
   if (!topic || typeof topic !== 'object') {
     throw new Error(`Topic at index ${index} is not a valid object.`)
@@ -396,6 +482,12 @@ function validateTopic(topic: unknown, index: number): TopicSuggestion {
     }
   }
 
+  if (hasUnsupportedHardNumber(title)) {
+    throw new Error(
+      `Topic at index ${index} eliminated: title contains unsupported hard-number claim. title: "${title}"`,
+    )
+  }
+
   const summary = typeof t.summary === 'string' ? sanitizeTopicSummary(t.summary.trim()) : ''
   if (summary.length < 10) {
     throw new Error(
@@ -441,6 +533,12 @@ function validateTopic(topic: unknown, index: number): TopicSuggestion {
     )
   }
 
+  if (hasUnsupportedHardNumber(angle) || hasUnsupportedHardNumber(contrarianAngle)) {
+    throw new Error(
+      `Topic at index ${index} eliminated: angle/contrarianAngle contains unsupported hard-number claim. title: "${title}"`,
+    )
+  }
+
   const timeToMainstream = validateTimeToMainstream(
     t.timeToMainstream,
     index,
@@ -454,6 +552,13 @@ function validateTopic(topic: unknown, index: number): TopicSuggestion {
   if (!hasValidSource) {
     throw new Error(
       `Topic at index ${index} eliminated: no valid source URL. title: "${title}"`,
+    )
+  }
+
+  const dataReadinessScore = computeDataReadinessScore(title, summary, sources)
+  if (dataReadinessScore <= 1 && valueScore < 9) {
+    throw new Error(
+      `Topic at index ${index} eliminated: data readiness too weak (${dataReadinessScore}). title: "${title}"`,
     )
   }
 
@@ -599,7 +704,7 @@ export async function runTopicAgent(
     throw new Error('TopicAgent JSON missing "topics" array. Raw: ' + text.slice(0, 500))
   }
 
-  const validated: TopicSuggestion[] = []
+  const validated: Array<{ topic: TopicSuggestion; score: number }> = []
   const normalize = (value: string) =>
     value.toLowerCase().replace(/[^\u4e00-\u9fa5a-z0-9]/g, '')
 
@@ -611,24 +716,27 @@ export async function runTopicAgent(
 
       const duplicate = validated.find((existing) => {
         const current = normalize(topic.title)
-        const accepted = normalize(existing.title)
+        const accepted = normalize(existing.topic.title)
         return current.includes(accepted) || accepted.includes(current)
       })
 
       if (duplicate) {
         console.warn(
-          `[TopicAgent] skip topic[${i}] as duplicate of "${duplicate.title}": "${topic.title}"`,
+          `[TopicAgent] skip topic[${i}] as duplicate of "${duplicate.topic.title}": "${topic.title}"`,
         )
         continue
       }
 
-      if (topic.valueScore >= 7 && topic.redSeaLevel === 'LOW') {
-        validated.unshift(topic)
-      } else {
-        validated.push(topic)
-      }
+      const dataReadinessScore = computeDataReadinessScore(topic.title, topic.summary, topic.sources)
+      const score =
+        publishabilityPriority(topic.title, topic.summary, topic.sources) * 100 +
+        dataReadinessScore * 10 +
+        topic.valueScore * 3 +
+        (topic.redSeaLevel === 'LOW' ? 6 : topic.redSeaLevel === 'MEDIUM' ? 2 : -10)
 
-      if (validated.length >= cfg.agent.count) break
+      validated.push({ topic, score })
+      validated.sort((a, b) => b.score - a.score)
+      if (validated.length > cfg.agent.count * 2) validated.length = cfg.agent.count * 2
     } catch (err) {
       console.warn(
         `[TopicAgent] skip topic[${i}]: ${err instanceof Error ? err.message : String(err)}`,
@@ -644,8 +752,8 @@ export async function runTopicAgent(
   }
 
   return {
-    topics: validated,
-    strategy: inferStrategy(validated),
+    topics: validated.slice(0, cfg.agent.count).map((item) => item.topic),
+    strategy: inferStrategy(validated.slice(0, cfg.agent.count).map((item) => item.topic)),
   }
 }
 

@@ -1,8 +1,58 @@
 import * as cheerio from 'cheerio'
+import * as https from 'https'
+import * as http from 'http'
+import { HttpsProxyAgent } from 'https-proxy-agent'
 import type { Tool, ToolResult } from './types'
+
+function getProxyUrl(): string | undefined {
+  return process.env.HTTPS_PROXY || process.env.https_proxy || process.env.HTTP_PROXY || process.env.http_proxy
+}
 
 function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms))
+}
+
+function fetchWithProxy(urlStr: string, timeout: number): Promise<{ ok: boolean; status: number; body: string }> {
+  return new Promise((resolve) => {
+    const isHttps = urlStr.startsWith('https://')
+    const url = new URL(urlStr)
+    const proxyUrl = getProxyUrl()
+    const agent = proxyUrl
+      ? new HttpsProxyAgent(proxyUrl)
+      : isHttps
+        ? https.globalAgent
+        : http.globalAgent
+
+    const options = {
+      hostname: url.hostname,
+      port: url.port || (isHttps ? 443 : 80),
+      path: url.pathname + url.search,
+      method: 'GET',
+      agent,
+      timeout,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+        'Accept': 'application/rss+xml, application/xml, text/xml, */*',
+        'Accept-Language': 'en-US,en;q=0.9',
+      },
+    }
+
+    const req = (isHttps ? https : http).request(options, (res) => {
+      let data = ''
+      res.on('data', (chunk) => data += chunk)
+      res.on('end', () => resolve({ ok: (res.statusCode ?? 0) >= 200 && (res.statusCode ?? 0) < 300, status: res.statusCode ?? 0, body: data }))
+    })
+    req.on('error', (err) => {
+      console.error('[web-search] Request error:', err.message)
+      resolve({ ok: false, status: 0, body: '' })
+    })
+    req.on('timeout', () => {
+      console.error('[web-search] Timeout! url:', urlStr, 'proxy:', proxyUrl)
+      req.destroy()
+      resolve({ ok: false, status: 0, body: '' })
+    })
+    req.end()
+  })
 }
 
 interface WebSearchParams {
@@ -19,7 +69,7 @@ export function createWebSearchTool(options: WebSearchToolOptions = {}): Tool {
 
   return {
     name: 'web_search',
-    description: 'Search the web for information using DuckDuckGo. Returns titles, URLs, and snippets.',
+    description: 'Search the web for information using Bing. Returns titles, URLs, and snippets.',
     parameters: {
       type: 'object',
       properties: {
@@ -39,20 +89,17 @@ export function createWebSearchTool(options: WebSearchToolOptions = {}): Tool {
       const { query, maxResults = 5 } = params as unknown as WebSearchParams
       const limit = Math.min(Number(maxResults), 10)
 
-      const searchUrl = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`
+      const searchUrl = `https://www.bing.com/search?q=${encodeURIComponent(query)}&format=rss`
 
       const maxRetries = options.maxRetries ?? 3
       let lastError = ''
 
       for (let attempt = 1; attempt <= maxRetries; attempt++) {
         try {
-          const response = await fetch(searchUrl, {
-            headers: { 'User-Agent': userAgent, 'Accept': 'text/html' },
-            signal: AbortSignal.timeout(15000),
-          })
+          const res = await fetchWithProxy(searchUrl, 15000)
 
-          if (!response.ok) {
-            lastError = `HTTP ${response.status} ${response.statusText}`
+          if (!res.ok) {
+            lastError = `HTTP ${res.status}`
             if (attempt < maxRetries) {
               await sleep(1000 * attempt)
               continue
@@ -60,20 +107,17 @@ export function createWebSearchTool(options: WebSearchToolOptions = {}): Tool {
             return { success: false, output: '', error: `Search failed after ${maxRetries} attempts: ${lastError}` }
           }
 
-          const html = await response.text()
-          const $ = cheerio.load(html)
+          const xml = res.body
+          const $ = cheerio.load(xml, { xml: true })
 
           const results: Array<{ title: string; url: string; snippet: string }> = []
 
-          // WARNING: These CSS selectors depend on DuckDuckGo's HTML structure.
-          // If DuckDuckGo changes their markup, these selectors will break silently.
-          // Monitor for empty results even when queries should return data.
-          const resultElements = $('.result')
+          // Parse Bing RSS format: <item><title>...</title><link>...</link><description>...</description></item>
+          const items = $('item')
 
-          if (resultElements.length === 0) {
-            // No .result elements found — likely means DuckDuckGo changed their HTML structure,
-            // or the request was blocked/rate-limited. Return explicit error rather than empty results.
-            lastError = `DuckDuckGo returned no parseable results (attempt ${attempt}/${maxRetries})`
+          if (items.length === 0) {
+            // No item elements found — likely means Bing blocked the request or returned an error page.
+            lastError = `Bing returned no parseable results (attempt ${attempt}/${maxRetries})`
             if (attempt < maxRetries) {
               await sleep(1000 * attempt)
               continue
@@ -81,27 +125,29 @@ export function createWebSearchTool(options: WebSearchToolOptions = {}): Tool {
             return {
               success: false,
               output: '',
-              error: `${lastError}. The HTML structure may have changed (selector ".result" matched 0 elements). Raw HTML length: ${html.length} chars.`,
+              error: `${lastError}. The RSS structure may have changed or the request was blocked. Raw XML length: ${xml.length} chars.`,
             }
           }
 
-          resultElements.each((_, el) => {
+          items.each((_, el) => {
             if (results.length >= limit) return
-            const title = $(el).find('.result__title').text().trim()
-            const url = $(el).find('.result__url').attr('href') ?? ''
-            const snippet = $(el).find('.result__snippet').text().trim()
+            const title = $(el).find('title').text().trim()
+            const url = $(el).find('link').text().trim()
+            const description = $(el).find('description').text().trim()
+            // Clean HTML tags from description
+            const snippet = description.replace(/<[^>]*>/g, '').trim()
             if (title && url) {
               results.push({ title, url, snippet })
             }
           })
 
           if (results.length === 0) {
-            lastError = 'DuckDuckGo returned result elements but none had valid title/url'
+            lastError = 'Bing returned item elements but none had valid title/link'
             if (attempt < maxRetries) {
               await sleep(1000 * attempt)
               continue
             }
-            return { success: false, output: '', error: lastError + '. Selectors ".result__title" / ".result__url" may have changed.' }
+            return { success: false, output: '', error: lastError + '. RSS item parsing may have failed.' }
           }
 
           const formatted = results

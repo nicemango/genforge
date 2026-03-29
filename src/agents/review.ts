@@ -304,9 +304,16 @@ async function runSynthesis(
   try {
     parsed = JSON.parse(jsonStr) as { fixedBody: string; writerBrief: WriterBrief }
   } catch (err) {
-    throw new Error(
-      `Synthesis failed: ${err instanceof Error ? err.message : String(err)}. ` + `Raw: ${jsonStr.slice(0, 300)}`,
-    )
+    const fixedBodyMatch = jsonStr.match(/"fixedBody"\s*:\s*"([\s\S]*?)"\s*(?:,\s*"writerBrief"|}$)/)
+    const coreProblemMatch = jsonStr.match(/"coreProblem"\s*:\s*"([\s\S]*?)"/)
+    parsed = {
+      fixedBody: fixedBodyMatch?.[1]?.replace(/\\"/g, '"').replace(/\\n/g, '\n') ?? body,
+      writerBrief: {
+        coreProblem: coreProblemMatch?.[1]?.replace(/\\"/g, '"') ?? '评审未通过',
+        mustFix: [],
+        keepGood: [],
+      },
+    }
   }
 
   return {

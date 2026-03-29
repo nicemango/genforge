@@ -58,8 +58,7 @@ export function createGenerateImageTool(apiKey: string): Tool {
     async execute(params: Record<string, unknown>): Promise<ToolResult> {
       const { prompt, aspectRatio = '16:9', n = 1 } = params as unknown as GenerateImageParams
       const safeN = Math.min(Number(n), 4)
-      const resolvedAspectRatio = aspectRatio ?? '16:9'
-      const key = cacheKey(prompt, resolvedAspectRatio)
+      const key = cacheKey(prompt, aspectRatio)
 
       try {
         // Check in-process cache first to avoid redundant API calls.
@@ -79,12 +78,25 @@ export function createGenerateImageTool(apiKey: string): Tool {
           }
         }
 
-        const result = await generateImages(apiKey, {
-          prompt,
-          aspectRatio: resolvedAspectRatio,
-          responseFormat: 'base64',
-          n: safeN,
-        })
+        const timeoutMs = 45_000
+        const controller = new AbortController()
+        const timeoutId = setTimeout(() => controller.abort(), timeoutMs)
+
+        let result: Awaited<ReturnType<typeof generateImages>>
+        try {
+          result = await generateImages(apiKey, {
+            prompt,
+            aspectRatio,
+            responseFormat: 'base64',
+            n: safeN,
+          })
+        } finally {
+          clearTimeout(timeoutId)
+        }
+
+        if (!result || !Array.isArray(result.images) || result.images.length === 0) {
+          return { success: false, output: '', error: 'MiniMax returned empty images array' }
+        }
 
         // Store base64 images in module-level map, return IDs to agent to avoid token bloat.
         const imageIds: string[] = []

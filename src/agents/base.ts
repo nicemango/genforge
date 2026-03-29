@@ -97,7 +97,9 @@ export class BaseAgent {
           resultBlocks.push({
             type: 'tool_result',
             tool_use_id: call.id,
-            content: result.success ? result.output : (result.error ?? result.output),
+            content: result.success
+              ? result.output
+              : (result.error || result.output || `Tool "${call.name}" failed with no error message`),
             is_error: !result.success,
           })
         }

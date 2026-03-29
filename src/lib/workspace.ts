@@ -35,6 +35,8 @@ export interface WorkspaceInfo {
     completedSteps: AgentType[]
     lastOutput: Record<string, unknown>
   }
+  /** Live progress of the currently executing step */
+  currentProgress?: StepProgressInfo
 }
 
 interface RunJson {
@@ -48,6 +50,14 @@ interface RunJson {
     completedSteps: AgentType[]
     lastOutput: Record<string, unknown>
   }
+  currentProgress?: StepProgressInfo
+}
+
+export interface StepProgressInfo {
+  phase: string
+  current: number
+  total: number
+  message?: string
 }
 
 export const STEP_ORDER: AgentType[] = [
@@ -103,6 +113,7 @@ export interface IWorkspaceStorage {
   writeOutput(workspaceId: string, step: AgentType, filename: string, content: string | Buffer): Promise<void>
   checkpoint(workspaceId: string, step: AgentType, output: unknown, topicId?: string): Promise<void>
   setStatus(workspaceId: string, status: 'completed' | 'failed'): Promise<void>
+  writeProgress(workspaceId: string, progress: StepProgressInfo): Promise<void>
   resume(workspaceId: string): Promise<{
     currentStep: AgentType
     previousOutputs: Record<string, unknown>
@@ -138,6 +149,7 @@ function toWorkspaceInfo(runJson: RunJson, workspacePath: string): WorkspaceInfo
     createdAt: runJson.createdAt,
     updatedAt: runJson.updatedAt,
     checkpoint: runJson.checkpoint,
+    currentProgress: runJson.currentProgress,
   }
 }
 
@@ -190,6 +202,15 @@ class FileSystemWorkspaceStorage implements IWorkspaceStorage {
     filename = 'output.json',
   ): Promise<unknown | null> {
     const workspacePath = getWorkspaceDir(workspaceId)
+    const runJsonPath = path.join(workspacePath, 'run.json')
+    if (fs.existsSync(runJsonPath)) {
+      try {
+        const runJson = JSON.parse(fs.readFileSync(runJsonPath, 'utf-8')) as RunJson
+        const stepOutput = runJson.checkpoint.lastOutput[step]
+        if (stepOutput !== undefined) return stepOutput
+      } catch { /* ignore */ }
+    }
+    // Fallback: read from step file
     const filePath = path.join(workspacePath, STEP_DIRS[step], filename)
     if (!fs.existsSync(filePath)) return null
     try {
@@ -247,6 +268,17 @@ class FileSystemWorkspaceStorage implements IWorkspaceStorage {
     const content = fs.readFileSync(runJsonPath, 'utf-8')
     const runJson = JSON.parse(content) as RunJson
     runJson.status = status
+    runJson.updatedAt = new Date().toISOString()
+    fs.writeFileSync(runJsonPath, JSON.stringify(runJson, null, 2), 'utf-8')
+  }
+
+  async writeProgress(workspaceId: string, progress: StepProgressInfo): Promise<void> {
+    const workspacePath = getWorkspaceDir(workspaceId)
+    const runJsonPath = path.join(workspacePath, 'run.json')
+    if (!fs.existsSync(runJsonPath)) return
+    const content = fs.readFileSync(runJsonPath, 'utf-8')
+    const runJson = JSON.parse(content) as RunJson
+    runJson.currentProgress = progress
     runJson.updatedAt = new Date().toISOString()
     fs.writeFileSync(runJsonPath, JSON.stringify(runJson, null, 2), 'utf-8')
   }
@@ -375,9 +407,11 @@ class DatabaseWorkspaceStorage implements IWorkspaceStorage {
       if (!taskRun) return null
 
       let checkpoint = { completedSteps: [] as AgentType[], lastOutput: {} as Record<string, unknown> }
+      let currentProgress: StepProgressInfo | undefined
       try {
         const outputData = JSON.parse(taskRun.output || '{}')
         checkpoint = outputData.checkpoint ?? checkpoint
+        currentProgress = outputData.currentProgress
       } catch { /* ignore */ }
 
       return {
@@ -386,12 +420,17 @@ class DatabaseWorkspaceStorage implements IWorkspaceStorage {
         path: `db://taskRun/${taskRun.id}`,
         status: taskRun.status === 'RUNNING' ? 'running'
           : taskRun.status === 'SUCCESS' ? 'completed' : 'failed',
-        currentStep: checkpoint.completedSteps.length > 0
-          ? STEP_ORDER[checkpoint.completedSteps.length]
-          : null,
+        currentStep: (() => {
+          if (checkpoint.completedSteps.length === 0) return null
+          const lastCompleted = checkpoint.completedSteps[checkpoint.completedSteps.length - 1]
+          const lastIdx = STEP_ORDER.indexOf(lastCompleted)
+          if (lastIdx === -1 || lastIdx >= STEP_ORDER.length - 1) return null
+          return STEP_ORDER[lastIdx + 1]
+        })(),
         createdAt: taskRun.startedAt.toISOString(),
         updatedAt: (taskRun.finishedAt ?? taskRun.startedAt).toISOString(),
         checkpoint,
+        currentProgress,
       }
     } catch {
       return null
@@ -410,6 +449,10 @@ class DatabaseWorkspaceStorage implements IWorkspaceStorage {
       if (!taskRun) return null
 
       const outputData = JSON.parse(taskRun.output || '{}')
+      // Prefer checkpoint.lastOutput (written by checkpoint()), fallback to step file data
+      if (outputData.checkpoint?.lastOutput?.[step] !== undefined) {
+        return outputData.checkpoint.lastOutput[step]
+      }
       const stepData = (outputData[step] as Record<string, unknown> | undefined) ?? {}
       return stepData[filename] ?? null
     } catch {
@@ -483,6 +526,20 @@ class DatabaseWorkspaceStorage implements IWorkspaceStorage {
     await prisma.taskRun.updateMany({
       where: { id: workspaceId, taskType: this.TASK_RUN_TYPE },
       data: { status: prismaStatus, finishedAt: new Date() },
+    })
+  }
+
+  async writeProgress(workspaceId: string, progress: StepProgressInfo): Promise<void> {
+    const taskRun = await prisma.taskRun.findFirst({
+      where: { id: workspaceId, taskType: this.TASK_RUN_TYPE },
+    })
+    if (!taskRun) return
+    let outputData: Record<string, unknown> = {}
+    try { outputData = JSON.parse(taskRun.output || '{}') } catch { /* ignore */ }
+    outputData.currentProgress = progress
+    await prisma.taskRun.update({
+      where: { id: workspaceId },
+      data: { output: JSON.stringify(outputData) },
     })
   }
 
@@ -626,6 +683,10 @@ export class WorkspaceManager {
 
   async setStatus(workspaceId: string, status: 'completed' | 'failed'): Promise<void> {
     return this.storage.setStatus(workspaceId, status)
+  }
+
+  async writeProgress(workspaceId: string, progress: StepProgressInfo): Promise<void> {
+    return this.storage.writeProgress(workspaceId, progress)
   }
 
   async resume(workspaceId: string): Promise<{

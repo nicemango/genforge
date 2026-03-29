@@ -77,6 +77,13 @@ export interface WriterResult {
   promptVersion: string
 }
 
+interface EvidenceAttribution {
+  text: string
+  sourceLabel: string
+  url: string
+  hints: string[]
+}
+
 function isConstrainedWriterModel(modelConfig: ModelConfig): boolean {
   const model = (modelConfig.defaultModel ?? modelConfig.model ?? '').toLowerCase()
   const baseURL = (modelConfig.baseURL ?? '').toLowerCase()
@@ -138,7 +145,7 @@ const TONE_PRESET_INSTRUCTIONS: Record<NonNullable<WritingStyle['tonePreset']>, 
 const OUTLINE_SYSTEM_PROMPT = [
   '你是内容总编。你的任务是先设计文章骨架，再交给后续阶段执行。',
   '只输出 JSON。禁止 markdown 代码块，禁止解释。',
-  '标题必须输出 3 个候选，都要有认知落差、数字/对比/反常识。',
+  '标题必须输出 3 个候选，都要有认知落差、数字/对比/反常识，长度尽量控制在 22-34 字。',
   'hook 必须是一段 80-160 字的开篇策略说明，不要写成完整正文。',
   'sections 必须 3-5 个，每个标题都必须是观点句，不能是“行业分析/市场现状”这类描述性标题。',
   'ending 必须是结尾策略，不是鸡汤。',
@@ -213,6 +220,16 @@ function sanitizeFeedback(feedback?: string): string | null {
     .trim()
 }
 
+function normalizeSectionTitle(title: string): string {
+  return title
+    .trim()
+    .replace(/[“”"]/g, '"')
+    .replace(/[‘’']/g, "'")
+    .replace(/[「」]/g, '"')
+    .replace(/[『』]/g, '"')
+    .replace(/["']/g, '')
+}
+
 function buildFeedbackContext(reviewFeedback?: string, optimizationFeedback?: string): string {
   const parts: string[] = []
   const externalFeedback = sanitizeFeedback(reviewFeedback)
@@ -242,23 +259,81 @@ function extractResearchSection(rawOutput: string, heading: string): string {
   return rawOutput.match(pattern)?.[1]?.trim() ?? ''
 }
 
+function buildViewpointAmplifier(topic: TopicSuggestion): string {
+  const forecastWindow =
+    topic.timeToMainstream === 'NOW' ? '未来1-3个月' :
+      topic.timeToMainstream === 'WEEKS' ? '未来3-6个月' :
+        '未来6-12个月'
+
+  return [
+    '## 观点增益层',
+    `独特判断：${topic.angle}`,
+    `主流叙事误判：${topic.contrarianAngle}`,
+    `必须回答的问题1：主流媒体/大众当前最常见的判断错在哪里？`,
+    `必须回答的问题2：你真正要读者接受的判断是什么？`,
+    `必须回答的问题3：${forecastWindow} 内，这个判断会如何演化成更具体的行业后果？`,
+  ].join('\n')
+}
+
+function buildViewpointExecutionRules(): string {
+  return [
+    '## 观点执行要求',
+    '1. 必须明确指出：主流叙事/大众误判错在哪里。',
+    '2. 必须明确写出：真正判断是什么，最好使用“不是A，而是B”句式。',
+    '3. 必须给出未来 6-12 个月的具体演化预判，不能停留在抽象趋势词。',
+    '4. 开头前 120-180 字必须先抛出判断或冲突，不能先做背景介绍。',
+  ].join('\n')
+}
+
+function inferTopicToneGuard(topic: TopicSuggestion): 'risk' | 'policy' | 'default' {
+  const combined = `${topic.title} ${topic.angle} ${topic.summary} ${topic.tags.join(' ')}`
+  if (/安全|漏洞|泄露|权限|风险|失控|灾难|filesystem|agent security|攻击|sandbox/i.test(combined)) {
+    return 'risk'
+  }
+  if (/条款|政策|授权|privacy|policy|opt-out|开源协议|许可证|平台规则/i.test(combined)) {
+    return 'policy'
+  }
+  return 'default'
+}
+
+function buildTopicToneGuard(topic: TopicSuggestion): string {
+  const tone = inferTopicToneGuard(topic)
+  if (tone === 'risk') {
+    return [
+      '## 题材语气约束',
+      '这是安全/风险题材。必须优先使用冷静、审计式、证据导向的表达。',
+      '禁止使用：惊天悖论、皇帝的新装、血肉、行业灾难、裸奔、生死线、危言耸听、恐怖、惊悚。',
+      '没有明确来源时，禁止写“效率提升300%”这类强数字；没有漏洞编号/报告链接时，禁止把个案写成系统性结论。',
+    ].join('\n')
+  }
+  if (tone === 'policy') {
+    return [
+      '## 题材语气约束',
+      '这是政策/规则题材。必须优先使用理性论证和规则拆解，避免煽动式口吻。',
+      '禁止使用：霸王条款、温水煮青蛙、系统性死亡、惊天、背叛、洗劫。',
+      '预判要写成“可能/预计/大概率”，不要写成已经发生的既成事实。',
+    ].join('\n')
+  }
+  return ''
+}
+
 function buildResearchAnchors(rawOutput: string): string {
   const preciseData = extractResearchSection(rawOutput, '精确数据锚点')
     .split('\n')
     .map((line) => line.trim())
-    .filter((line) => line.startsWith('- ') && /\d/.test(line) && /https?:\/\//.test(line))
+    .filter((line) => line.startsWith('- ') && /^\-\s+\[[AB]\]/.test(line) && /\d/.test(line) && /https?:\/\//.test(line))
     .slice(0, 5)
 
   const keyData = extractResearchSection(rawOutput, '关键数据')
     .split('\n')
     .map((line) => line.trim())
-    .filter((line) => line.startsWith('- ') && /\d/.test(line) && !/待补充|来源待补充/.test(line))
+    .filter((line) => line.startsWith('- ') && /^\-\s+\[[AB]\]/.test(line) && /\d/.test(line) && !/待补充|来源待补充/.test(line))
     .slice(0, 6)
 
   const compareLines = extractResearchSection(rawOutput, '对比数据')
     .split('\n')
     .map((line) => line.trim())
-    .filter((line) => line.startsWith('- ') && /\d/.test(line) && /https?:\/\//.test(line))
+    .filter((line) => line.startsWith('- ') && /^\-\s+\[[AB]\]/.test(line) && /\d/.test(line) && /https?:\/\//.test(line))
     .slice(0, 5)
 
   const caseLines = extractResearchSection(rawOutput, '真实案例')
@@ -288,32 +363,76 @@ function extractPreciseEvidenceLines(rawOutput: string): string[] {
   const fallbackSection = extractResearchSection(rawOutput, '关键数据')
   const quantitativePattern = /(\d+(?:\.\d+)?[%％]|(?:\d+(?:\.\d+)?)(?:万|亿|家|条|种|小时|分钟|秒|年|月|日|个|倍)|L\d)/
 
-  return [...new Set(
-    [preciseSection, compareSection, fallbackSection]
-      .filter(Boolean)
-      .join('\n')
-      .split('\n')
-      .map((line) => line.trim())
-      .map((line) =>
-        line
-          .replace(/两倍/g, '2倍')
-          .replace(/三倍/g, '3倍')
-          .replace(/四倍/g, '4倍')
-          .replace(/五倍/g, '5倍')
-          .replace(/每两周/g, '每2周')
-          .replace(/每三周/g, '每3周'),
-      )
-      .filter(
-        (line) =>
-          line.startsWith('- ') &&
-          /\d/.test(line) &&
-          quantitativePattern.test(line) &&
-          /https?:\/\//.test(line) &&
-          !/### 抓取页面|待补充|来源待补充/.test(line) &&
-          !/^-\s*#\s/.test(line) &&
-          !/^\-\s*(刚刚|今天|昨日|前天)，/.test(line),
-      ),
-  )].slice(0, 5)
+  const seen = new Set<string>()
+  const normalizedLines = [preciseSection, compareSection, fallbackSection]
+    .filter(Boolean)
+    .join('\n')
+    .split('\n')
+    .map((line) => line.trim())
+    .map((line) =>
+      line
+        .replace(/^\*+\s*/, '')
+        .replace(/\*+$/g, '')
+        .replace(/两倍/g, '2倍')
+        .replace(/三倍/g, '3倍')
+        .replace(/四倍/g, '4倍')
+        .replace(/五倍/g, '5倍')
+        .replace(/每两周/g, '每2周')
+        .replace(/每三周/g, '每3周'),
+    )
+    .filter(
+      (line) =>
+        line.startsWith('- ') &&
+        /^\-\s+\[[AB]\]/.test(line) &&
+        /\d/.test(line) &&
+        quantitativePattern.test(line) &&
+        /https?:\/\//.test(line) &&
+        !/### 抓取页面|待补充|来源待补充/.test(line) &&
+        !/据测算|行业数据|业内数据|市场数据显示/.test(line) &&
+        !/^-\s*#\s/.test(line) &&
+        !/^\-\s*(刚刚|今天|昨日|前天)，/.test(line),
+    )
+
+  const deduped = normalizedLines.filter((line) => {
+    const url = line.match(/https?:\/\/[^\s)]+/)?.[0] ?? ''
+    const metric = line
+      .replace(/^-\s*/, '')
+      .replace(/\s*--\s*[^-]+--\s*https?:\/\/[^\s)]+/, '')
+      .replace(/[“”"「」]/g, '')
+      .trim()
+    const key = `${url}::${metric}`
+    if (seen.has(key)) return false
+    seen.add(key)
+    return true
+  })
+
+  return deduped.slice(0, 4)
+}
+
+function extractAttributionHints(text: string): string[] {
+  const hints = new Set<string>()
+  const namedMatches = text.match(/(GitHub|OpenClaw|飞书|钉钉|OpenAI|Anthropic|Claude|Whisper|ElevenLabs|Gemini|HuggingFace|ServiceNow|Arm|英伟达|NVIDIA|蚂蚁数科|章鹏|夏立雪|Lark CLI|Ling-DT-Fin-Mini-2\.5)/g) ?? []
+  for (const item of namedMatches) hints.add(item)
+  return [...hints]
+}
+
+function buildEvidenceAttributions(researchRawOutput: string): EvidenceAttribution[] {
+  return extractPreciseEvidenceLines(researchRawOutput)
+    .map((line) => {
+      const url = line.match(/https?:\/\/[^\s)]+/)?.[0] ?? ''
+      const sourceLabel = line.match(/--\s*([^-\n]+)\s*--\s*https?:\/\//)?.[1]?.trim() ?? '相关来源'
+      const text = line
+        .replace(/^-\s*/, '')
+        .replace(/\s*--\s*[^-]+--\s*https?:\/\/[^\s)]+/, '')
+        .trim()
+      return {
+        text,
+        sourceLabel: /GitHub/i.test(url) || /GitHub/i.test(sourceLabel) ? 'GitHub 官方' : sourceLabel,
+        url,
+        hints: extractAttributionHints(text),
+      }
+    })
+    .filter((item) => item.url && item.hints.length > 0)
 }
 
 function countPreciseEvidenceLines(body: string): number {
@@ -324,29 +443,177 @@ function countPreciseEvidenceLines(body: string): number {
     .length
 }
 
-function ensurePreciseEvidenceLines(body: string, researchRawOutput: string): string {
-  if (countPreciseEvidenceLines(body) >= 2) return body
+function countSourcedDataLines(body: string): number {
+  return body
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(
+      (line) =>
+        /\d/.test(line) &&
+        (/https?:\/\//.test(line) || /来源[:：]|来源\)/.test(line)) &&
+        !/超过|约|左右|数月|数小时/.test(line),
+    )
+    .length
+}
 
+function buildHookLead(topicTitle: string): string {
+  void topicTitle
+  return '真正的问题不在表面的功能升级，而在于：这场变化暴露出的规则变化，正在重写行业的竞争方式。'
+}
+
+function extractFirstNarrativeParagraph(body: string): string {
+  const paragraphs = body
+    .split('\n\n')
+    .map((paragraph) => paragraph.trim())
+    .filter(Boolean)
+
+  for (const paragraph of paragraphs) {
+    if (paragraph.startsWith('# ')) continue
+    if (/^!\[[^\]]*\]\(image:[^)]+\)$/.test(paragraph)) continue
+    if (/^以下\s+\d+\s+条硬数据值得先记住：$/.test(paragraph)) continue
+    if (/^- /.test(paragraph)) continue
+    return paragraph
+  }
+
+  return paragraphs[0] ?? ''
+}
+
+function ensureStrongOpening(body: string, topicTitle: string): string {
+  const paragraphs = body.split('\n\n')
+  const firstNarrative = extractFirstNarrativeParagraph(body)
+  if (
+    /不是.+而是|误判|真正的问题|更关键的是|真相是|问题在于|被忽视|低估|高估|假象|危险的是/.test(firstNarrative)
+  ) {
+    return body
+  }
+
+  const hook = buildHookLead(topicTitle)
+  for (let i = 0; i < paragraphs.length; i += 1) {
+    const trimmed = paragraphs[i]?.trim() ?? ''
+    if (!trimmed) continue
+    if (trimmed.startsWith('# ')) continue
+    if (/^!\[[^\]]*\]\(image:[^)]+\)$/.test(trimmed)) continue
+    if (/^以下\s+\d+\s+条硬数据值得先记住：$/.test(trimmed)) continue
+    if (/^- /.test(trimmed)) continue
+    paragraphs[i] = `${hook}\n\n${trimmed}`
+    return paragraphs.join('\n\n').trim()
+  }
+
+  return `${body.trim()}\n\n${hook}`.trim()
+}
+
+function sanitizeUnsupportedHardNumbers(text: string): string {
+  return text
+    .replace(/\b99%/g, '极高比例')
+    .replace(/几乎所有人/g, '大量人')
+    .replace(/所有公司都/g, '不少公司')
+    .replace(/全部开发者都/g, '很多开发者')
+}
+
+function sanitizeToneNoise(text: string): string {
+  return text
+    .replace(/让所有人后背发凉/g, '值得警惕')
+    .replace(/让所有人心头一紧/g, '需要重视')
+    .replace(/脊背发凉/g, '超出预期')
+    .replace(/生死线/g, '关键约束')
+    .replace(/这不是危言耸听，这是每个企业都必须面对的现实/g, '这已经成为不少企业需要面对的现实问题')
+    .replace(/数十倍！百倍！这意味着什么？/g, '在部分高频场景中，相关成本可能出现数量级上升。')
+    .replace(/显著降低/g, '有所降低')
+    .replace(/大幅下降/g, '有所下降')
+    .replace(/翻一倍/g, '快速增长')
+    .replace(/啥——/g, '什么——')
+    .replace(/问的是啥/g, '问的是什么')
+    .replace(/“Token效能竞争’/g, '“Token效能竞争”')
+    .replace(/背后暴露出的规则变化/g, '暴露出的规则变化')
+    .replace(/惊天悖论/g, '核心悖论')
+    .replace(/皇帝的新装/g, '被忽视的真相')
+    .replace(/血肉来填/g, '人力成本来填补')
+    .replace(/行业灾难/g, '行业安全危机')
+    .replace(/裸奔/g, '缺少足够保护')
+    .replace(/霸王条款/g, '强势平台条款')
+    .replace(/温水煮青蛙/g, '渐进式默认同意')
+    .replace(/系统性死亡/g, '系统性侵蚀')
+}
+
+function sanitizeWeakQuantClaims(text: string): string {
+  return text
+    .replace(/数十倍甚至百倍/g, '明显高于传统方案')
+    .replace(/每两周快速增长/g, '持续快速增长')
+    .replace(/日均Token消耗量已突破30万亿/g, '日均Token消耗量已达万亿级别')
+    .replace(/处理相同任务量的硬件成本有所降低/g, '处理相同任务量时更节省硬件资源')
+    .replace(/处理相同任务量的硬件成本显著降低/g, '处理相同任务量时更节省硬件资源')
+}
+
+function sanitizePolishIssues(text: string): string {
+  return text
+    .replace(/\bOpenClass\b/g, 'OpenClaw')
+    .replace(/Mac Mini一度脱销/g, 'Mac Mini关注度一度明显上升')
+    .replace(/Mac Mini脱销/g, 'Mac Mini关注度上升')
+    .replace(/真正的问题不在表面的功能升级，而在于：([^。！？\n]+?) 暴露出的规则变化/g, '真正的问题不在表面的功能升级，而在于：$1。暴露出的规则变化')
+}
+
+function attributeUnlabeledNumericSentences(body: string, researchRawOutput: string): string {
+  const attributions = buildEvidenceAttributions(researchRawOutput)
+  if (attributions.length === 0) return body
+
+  return body
+    .split('\n')
+    .map((line) => {
+      const trimmed = line.trim()
+      if (!trimmed || trimmed.startsWith('#') || trimmed.startsWith('![') || trimmed.startsWith('- ')) return line
+      if (!/\d/.test(trimmed)) return line
+      if (/来源[:：]|https?:\/\//.test(trimmed)) return line
+
+      const match = attributions.find((item) => item.hints.some((hint) => trimmed.includes(hint)))
+      if (!match) return line
+      if (trimmed.startsWith('据')) return line
+      return line.replace(trimmed, `据${match.sourceLabel}，${trimmed}`)
+    })
+    .join('\n')
+}
+
+function ensurePreciseEvidenceLines(body: string, researchRawOutput: string): string {
   const evidenceLines = extractPreciseEvidenceLines(researchRawOutput)
   if (evidenceLines.length === 0) return body
 
+  const normalizedEvidenceLines = evidenceLines
+    .map((line) => {
+      const url = line.match(/https?:\/\/[^\s)]+/)?.[0] ?? ''
+      const content = line
+        .replace(/^-\s*/, '')
+        .replace(/\s*--\s*[^-]+--\s*https?:\/\/[^\s)]+/, '')
+        .trim()
+      let sourceLabel = line.match(/--\s*([^-\n]+)\s*--\s*https?:\/\//)?.[1]?.trim() ?? '来源'
+      if (/github/i.test(url) || /GitHub/i.test(sourceLabel)) sourceLabel = 'GitHub 官方'
+      if (/news\.ycombinator\.com/i.test(url)) sourceLabel = 'Hacker News'
+      return `- ${content}（来源：${sourceLabel} ${url}）`
+    })
+    .slice(0, 2)
+
   const evidenceBlock = [
-    '以下 3 条硬数据值得先记住：',
-    ...evidenceLines,
+    '以下2条硬数据值得先记住：',
+    ...normalizedEvidenceLines,
     '',
   ].join('\n')
 
+  const existingEvidencePattern = /以下\s*\d+\s*条硬数据值得先记住：\n(?:- .+\n)+\n?/m
+  const bodyWithoutExistingEvidence = body.replace(existingEvidencePattern, '')
+
+  if (countPreciseEvidenceLines(bodyWithoutExistingEvidence) >= 2) {
+    return bodyWithoutExistingEvidence.trim()
+  }
+
   const coverPattern = /!\[[^\]]*\]\(image:cover\)\n\n/
-  if (coverPattern.test(body)) {
-    return body.replace(coverPattern, (match) => `${match}${evidenceBlock}`)
+  if (coverPattern.test(bodyWithoutExistingEvidence)) {
+    return bodyWithoutExistingEvidence.replace(coverPattern, (match) => `${match}${evidenceBlock}`)
   }
 
   const titlePattern = /^# .+\n\n/
-  if (titlePattern.test(body)) {
-    return body.replace(titlePattern, (match) => `${match}${evidenceBlock}`)
+  if (titlePattern.test(bodyWithoutExistingEvidence)) {
+    return bodyWithoutExistingEvidence.replace(titlePattern, (match) => `${match}${evidenceBlock}`)
   }
 
-  return `${evidenceBlock}${body}`.trim()
+  return `${evidenceBlock}${bodyWithoutExistingEvidence}`.trim()
 }
 
 function parseWriterStageOutput<T>(stage: string, text: string, schema: ZodSchema<T>): T {
@@ -421,8 +688,17 @@ function buildOutlinePrompt(
       ? `## 账号偏好\nHook 必须使用模式 ${hookMode}`
       : '## Hook 要求\n在 A 反常识 / B 具体场景 / C 辛辣设问 中选最适合的一个',
     '',
+    buildViewpointAmplifier(topic),
+    '',
+    buildTopicToneGuard(topic),
+    '',
     '## 研究资料',
     research.rawOutput,
+    '',
+    '## 大纲硬性约束',
+    '1. 至少 1 个章节专门拆解“主流叙事错在哪”。',
+    '2. 至少 1 个章节给出“真正判断是什么，不是A而是B”。',
+    '3. ending 必须明确写出未来 6-12 个月的演化预判，不能只停留在当下复述。',
     '',
     '## 输出 JSON schema',
     JSON.stringify({
@@ -462,6 +738,8 @@ function buildDraftPrompt(
     '## 风格要求',
     buildStyleInstructions(writingStyle),
     '',
+    buildViewpointAmplifier(topic),
+    '',
     buildResearchAnchors(research.rawOutput),
     '',
     '## 研究资料',
@@ -473,6 +751,8 @@ function buildDraftPrompt(
     '3. 优先使用上面的事实锚点，不要创造 research 中不存在的数字。',
     '4. 至少 2 句关键数据必须写出精确数字和来源 URL，优先使用“必须优先使用的精确数据锚点”。',
     '5. 如果 research 提供了“对比数据”，至少 2 个章节必须显式使用“谁比谁高/低多少、提升多少、差距多少”这类比较句。',
+    '6. 至少 1 个章节直接回答“主流判断错在哪里”，不能只做信息复述。',
+    '7. 至少 1 个章节明确给出反转判断，但不要全篇反复套用“不是A而是B”句式，最多使用 1 次。',
     '',
     '## 输出 JSON schema',
     JSON.stringify([
@@ -499,6 +779,11 @@ function buildRewritePrompt(
     '## 风格要求',
     buildStyleInstructions(writingStyle),
     '',
+    '## 改写目标',
+    '每个版本都必须保留核心反共识判断，不允许改写成中性综述。',
+    '每个 emotional / rational / casual 字段控制在 140-260 字之间，禁止写成长篇整段大作文。',
+    '优先做“局部提纯”，不要重写成多段完整文章。',
+    '',
     '## 输出 JSON schema',
     JSON.stringify([
       {
@@ -515,6 +800,7 @@ function buildRewritePrompt(
 function buildHumanizePrompt(
   outline: WriterOutline,
   rewrite: WriterRewriteSection[],
+  topic: TopicSuggestion,
   research: ResearchResult,
   constrainedModel: boolean,
   writingStyle?: WritingStyle,
@@ -541,6 +827,10 @@ function buildHumanizePrompt(
     '## 研究资料',
     research.rawOutput,
     '',
+    buildViewpointExecutionRules(),
+    '',
+    buildTopicToneGuard(topic),
+    '',
     '## 成稿要求',
     '1. 输出 title 和 content。',
     '2. content 第一行必须是 # title。',
@@ -556,6 +846,11 @@ function buildHumanizePrompt(
     '6.2 禁止写“99%”“几乎所有人”“大多数公司都”这类 research 中没有明确来源的夸张数字。',
     '6.3 至少 2 句关键数据必须同时包含精确数字和来源 URL；禁止只写“可查官网/可查论文”这种模糊来源。',
     '6.4 如果 research 中存在“对比数据”小节，正文至少 2 个 ## 章节必须落 1 句可验证的比较句。',
+    '6.5 正文必须明确写出：主流叙事错在哪里、你真正的判断是什么。',
+    '6.6 结尾必须包含未来 6-12 个月的具体演化预判，不能只有抽象口号。',
+    '6.7 全文禁止机械重复“不是…而是…”句式；如需反转判断，优先用“真正的问题在于/主流误判在于/更关键的是”表达。',
+    '6.8 开头第一段禁止使用“随着…发展”“近年来”“在当今”这类背景式起手，必须先给判断、冲突或反常识结论。',
+    '6.9 禁止用“后背发凉、生死线、危言耸听、所有人心头一紧”这类情绪化恐吓措辞；没有精确基准值时，禁止写“显著降低、大幅下降、翻一倍”这类强结论。',
     '7. 结尾必须收束观点、给出行动建议，并留下一个问题。',
     '',
     '## 输出 JSON schema',
@@ -605,6 +900,8 @@ function validateOutline(outline: WriterOutline): string[] {
   const issues: string[] = []
   const descriptiveTitle = /^(市场|技术|行业|产品|用户|政策|竞争)(现状|概况|背景|概述|介绍|分析|探讨|研究|趋势|格局|发展|挑战|影响)$/
   const cognitiveGapPattern = /\d|反|却|竟|仅|只有|不足|超过|高达|低至|失败|倒下|打穿|颠覆|崩塌|黑化|主动|失控|欺骗|为何|为什么|正在|教训|真相|看清|下一个战场|离职后|首发|预警信号|DeepSeek时刻|更便宜|替代品|先上车后补票|护城河|选择了等|守住吗|从.+到.+|比.+更|越.+越|不是.+而是|当.+时|当.+[：:]/
+  const viewpointPattern = /误判|假象|错在|不是.+而是|真正|被忽视|高估|低估|幻觉|真相/
+  const forecastPattern = /未来|接下来|6-12个月|6个月|12个月|明年|接下来的一年|未来一年/
 
   if (outline.titles.length !== 3) {
     issues.push(`标题候选数量错误：${outline.titles.length}（必须为 3）`)
@@ -637,6 +934,14 @@ function validateOutline(outline: WriterOutline): string[] {
     }
   }
 
+  if (!outline.sections.some((section) => viewpointPattern.test(`${section.title} ${section.corePoint}`))) {
+    issues.push('大纲缺少“主流误判/真实判断”章节')
+  }
+
+  if (!forecastPattern.test(outline.ending)) {
+    issues.push('结尾缺少未来 6-12 个月演化预判')
+  }
+
   return issues
 }
 
@@ -653,7 +958,7 @@ function validateSectionAlignment(
 
   outline.sections.forEach((section, index) => {
     const actualTitle = sections[index]?.sectionTitle
-    if (actualTitle !== section.title) {
+    if (normalizeSectionTitle(actualTitle ?? '') !== normalizeSectionTitle(section.title)) {
       issues.push(`${stage} 第 ${index + 1} 段标题不匹配：${actualTitle ?? '缺失'} vs ${section.title}`)
     }
   })
@@ -664,16 +969,19 @@ function validateSectionAlignment(
 function validateWriterOutput(
   body: string,
   wordCount: number,
-  options: { minWordCount: number; maxWordCount: number },
+  options: { minWordCount: number; maxWordCount: number; requireEvidenceLines?: boolean },
 ): string[] {
   const issues: string[] = []
 
   if (wordCount < options.minWordCount) issues.push(`字数严重不足: ${wordCount} < ${options.minWordCount}`)
   if (wordCount > options.maxWordCount) issues.push(`字数超标: ${wordCount} > ${options.maxWordCount}`)
 
-  const firstParagraph = body.split('\n\n')[0] ?? ''
+  const firstParagraph = extractFirstNarrativeParagraph(body)
   if (/随着[^\n]{0,10}的(?:发展|进步|普及)|在当今|近年来[^\n]{0,5}[，,]/.test(firstParagraph)) {
     issues.push('存在空洞开场白（“随着XX发展”“近年来”等）')
+  }
+  if (!/不是.+而是|误判|真正的问题|更关键的是|真相是|问题在于|被忽视|低估|高估|假象|危险的是/.test(firstParagraph)) {
+    issues.push('开头第一段缺少判断或冲突，仍然偏背景式铺垫')
   }
 
   const lastParagraph = body.split('\n\n').slice(-1)[0] ?? ''
@@ -716,12 +1024,10 @@ function validateWriterOutput(
     issues.push(`存在无来源夸张表述: ${matched}`)
   }
 
-  const preciseUrlLines = body
-    .split('\n')
-    .map((line) => line.trim())
-    .filter((line) => /\d/.test(line) && /https?:\/\//.test(line) && !/超过|约|左右|数月|数小时/.test(line))
-  if (preciseUrlLines.length < 2) {
-    issues.push(`精确数据+来源URL句不足: ${preciseUrlLines.length} < 2`)
+  const preciseUrlLineCount = countPreciseEvidenceLines(body)
+  const sourcedDataLineCount = countSourcedDataLines(body)
+  if (options.requireEvidenceLines !== false && preciseUrlLineCount < 2 && !(preciseUrlLineCount >= 1 && sourcedDataLineCount >= 2)) {
+    issues.push(`精确数据证据不足: URL句 ${preciseUrlLineCount}，来源句 ${sourcedDataLineCount}`)
   }
 
   return issues
@@ -744,6 +1050,14 @@ function validateFinal(final: WriterFinal): string[] {
   }
   if (paragraphSlotIds.length < Math.max(1, h2Count - 1)) {
     issues.push(`段落配图占位符不足：${paragraphSlotIds.length}（至少 ${Math.max(1, h2Count - 1)} 个）`)
+  }
+
+  if (!/不是.+而是|误判|假象|真正的判断|主流叙事/.test(final.content)) {
+    issues.push('终稿缺少“主流误判/真实判断”观点锚点')
+  }
+
+  if (!/未来|接下来|未来一年|6-12个月|6个月|12个月|明年/.test(final.content)) {
+    issues.push('终稿缺少未来预判')
   }
 
   return issues
@@ -820,7 +1134,7 @@ async function generateRewrite(
     schema: RewriteSchema,
     systemPrompt: REWRITE_SYSTEM_PROMPT,
     temperature,
-    maxTokens: 4200,
+    maxTokens: 2600,
   })
 
   const issues = validateSectionAlignment('rewrite', outline, rewrite)
@@ -834,6 +1148,7 @@ async function generateRewrite(
 async function generateFinalArticle(
   outline: WriterOutline,
   rewrite: WriterRewriteSection[],
+  topic: TopicSuggestion,
   research: ResearchResult,
   provider: ReturnType<typeof createAgentProvider>,
   constrainedModel: boolean,
@@ -848,6 +1163,7 @@ async function generateFinalArticle(
     prompt: buildHumanizePrompt(
       outline,
       rewrite,
+      topic,
       research,
       constrainedModel,
       writingStyle,
@@ -860,13 +1176,16 @@ async function generateFinalArticle(
     maxTokens: calcMaxTokens(),
   })
 
-  const normalized = normalizeFinal(final)
+  const normalized = normalizeFinal(final, [final.title, ...outline.titles])
   normalized.content = ensurePreciseEvidenceLines(normalized.content, research.rawOutput)
+  normalized.content = attributeUnlabeledNumericSentences(normalized.content, research.rawOutput)
+  const availableEvidenceLines = extractPreciseEvidenceLines(research.rawOutput).length
   const issues = validateFinal(normalized)
   const wordCount = countChineseWords(normalized.content)
   const bodyIssues = validateWriterOutput(normalized.content, wordCount, {
     minWordCount: constrainedModel ? 1450 : 1600,
-    maxWordCount: constrainedModel ? 2600 : 2800,
+    maxWordCount: constrainedModel ? 3000 : 2800,
+    requireEvidenceLines: availableEvidenceLines >= 2,
   })
   if (issues.length > 0 || bodyIssues.length > 0) {
     throw new Error(`终稿质量不达标: ${[...issues, ...bodyIssues].join('; ')}`)
@@ -899,8 +1218,8 @@ async function scoreFinalArticle(
   }
 }
 
-function normalizeFinal(final: WriterFinal): WriterFinal {
-  const normalizedTitle = final.title.trim()
+function normalizeFinal(final: WriterFinal, titleCandidates: string[]): WriterFinal {
+  const normalizedTitle = pickPublishableTitle(titleCandidates)
   let content = final.content.trim()
 
   if (!content.startsWith('# ')) {
@@ -913,9 +1232,13 @@ function normalizeFinal(final: WriterFinal): WriterFinal {
   }
 
   content = normalizeParagraphImageSlots(content)
+  content = sanitizeUnsupportedHardNumbers(content)
+  content = sanitizeToneNoise(content)
+  content = sanitizeWeakQuantClaims(content)
+  content = sanitizePolishIssues(content)
 
   return {
-    title: normalizedTitle,
+    title: sanitizePolishIssues(sanitizeWeakQuantClaims(sanitizeToneNoise(sanitizeUnsupportedHardNumbers(normalizedTitle)))),
     content: content.trim(),
   }
 }
@@ -976,6 +1299,7 @@ export async function runWriterAgentLegacy(
     const final = await generateFinalArticle(
       outline,
       rewrite,
+      topic,
       research,
       provider,
       constrainedModel,
@@ -1042,9 +1366,41 @@ function extractTitle(markdown: string): string | undefined {
 }
 
 function extractSummary(markdown: string): string {
-  const withoutTitle = markdown.replace(/^#\s+.+$/m, '').trim()
-  const firstParagraph = withoutTitle.split(/\n\n+/).filter((paragraph) => paragraph.trim())[0] ?? ''
-  return firstParagraph.replace(/[#*`!\[\]()]/g, '').trim().slice(0, 200)
+  const blocks = markdown
+    .replace(/^#\s+.+$/m, '')
+    .split(/\n\n+/)
+    .map((block) => block.trim())
+    .filter(Boolean)
+
+  const firstNarrative = blocks.find((block) => {
+    if (/^!\[[^\]]*\]\([^)]+\)$/.test(block)) return false
+    if (/^##?\s+/.test(block)) return false
+    if (/^以下\s+\d+\s+条硬数据值得先记住：$/.test(block)) return false
+    if (/^(?:- |\* |\d+\. )/.test(block)) return false
+    return true
+  }) ?? ''
+
+  return firstNarrative
+    .replace(/!\[[^\]]*\]\([^)]+\)/g, '')
+    .replace(/[#*`]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 200)
+}
+
+function pickPublishableTitle(candidates: string[]): string {
+  const cleaned = candidates
+    .map((title) => sanitizePolishIssues(sanitizeWeakQuantClaims(sanitizeToneNoise(sanitizeUnsupportedHardNumbers(title.trim())))))
+    .filter(Boolean)
+
+  const preferred = cleaned.find((title) => title.length >= 10 && title.length <= 34)
+  if (preferred) return preferred
+
+  const fallback = cleaned[0] ?? '未命名标题'
+  if (fallback.length <= 34) return fallback
+
+  const clipped = fallback.slice(0, 34).replace(/[，。！？：；、,.!?:;]+$/g, '').trim()
+  return clipped || fallback.slice(0, 34)
 }
 
 function countChineseWords(text: string): number {

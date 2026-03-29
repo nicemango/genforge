@@ -60,15 +60,11 @@ function buildTemplateSvg(
   if (item.imageType === 'cover-hero' && item.renderMode === 'template') {
     const [, , subject = '平台规则与权限结构', action = '默认开关、授权面板、代码仓库与产品权限关系', risk = '默认设置会慢慢变成行业标准'] =
       item.prompt.split('｜')
-    const titleLines = wrapText(item.sectionTitle || item.alt || '文章封面', 16).slice(0, 3)
-    const titleTspans = titleLines
-      .map((line, index) => `<tspan x="132" dy="${index === 0 ? 0 : 72}">${escapeXml(line)}</tspan>`)
-      .join('')
-    const infoLines = [subject, action, risk].map((line) => clampText(cleanBulletText(line), 28))
-    const infoSvg = infoLines
+    const chips = [subject, action, risk].map((line) => clampText(cleanBulletText(line), 14))
+    const chipSvg = chips
       .map((line, index) => {
-        const y = 470 + index * 90
-        return `<rect x="132" y="${y - 34}" width="18" height="18" rx="6" fill="${palette.primary}" opacity="${0.9 - index * 0.15}"/><text x="176" y="${y}" fill="${palette.text}" font-size="32" font-family="PingFang SC, Microsoft YaHei, sans-serif">${escapeXml(line)}</text>`
+        const x = 120 + index * 212
+        return `<rect x="${x}" y="118" width="184" height="42" rx="21" fill="${palette.primary}" fill-opacity="${0.08 + index * 0.04}"/><text x="${x + 24}" y="146" fill="${palette.primary}" font-size="20" font-family="PingFang SC, Microsoft YaHei, sans-serif" font-weight="600">${escapeXml(line)}</text>`
       })
       .join('')
 
@@ -83,22 +79,37 @@ function buildTemplateSvg(
       <stop offset="0%" stop-color="${palette.primary}" stop-opacity="0.18"/>
       <stop offset="100%" stop-color="${palette.primary}" stop-opacity="0.04"/>
     </linearGradient>
+    <linearGradient id="screenGlow" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#ffffff" stop-opacity="0.96"/>
+      <stop offset="100%" stop-color="${palette.backgroundAccent}" stop-opacity="0.84"/>
+    </linearGradient>
   </defs>
   <rect width="${width}" height="${height}" fill="url(#coverBg)" rx="42"/>
   <rect x="78" y="70" width="${width - 156}" height="${height - 140}" fill="#ffffff" rx="34"/>
-  <rect x="108" y="112" width="228" height="58" fill="${palette.tagBackground}" rx="29"/>
-  <text x="142" y="150" fill="${palette.primary}" font-size="26" font-family="PingFang SC, Microsoft YaHei, sans-serif" font-weight="700" letter-spacing="2">PLATFORM SIGNAL</text>
-  <text x="132" y="276" fill="${palette.text}" font-size="60" font-family="PingFang SC, Microsoft YaHei, sans-serif" font-weight="700">${titleTspans}</text>
-  <rect x="${width - 458}" y="126" width="308" height="252" fill="url(#heroPanel)" rx="28"/>
-  <rect x="${width - 412}" y="160" width="216" height="24" fill="${palette.primary}" opacity="0.18" rx="12"/>
-  <rect x="${width - 412}" y="210" width="176" height="24" fill="${palette.primary}" opacity="0.12" rx="12"/>
-  <rect x="${width - 412}" y="260" width="196" height="24" fill="${palette.primary}" opacity="0.16" rx="12"/>
-  <rect x="${width - 246}" y="312" width="54" height="54" fill="${palette.primary}" rx="14"/>
-  <rect x="${width - 370}" y="314" width="92" height="18" fill="${palette.primary}" opacity="0.20" rx="9"/>
-  <rect x="${width - 370}" y="346" width="138" height="18" fill="${palette.primary}" opacity="0.12" rx="9"/>
-  <line x1="132" y1="404" x2="${width - 132}" y2="404" stroke="${palette.border}" stroke-width="2"/>
-  ${infoSvg}
-  <text x="132" y="${height - 84}" fill="${palette.muted}" font-size="28" font-family="PingFang SC, Microsoft YaHei, sans-serif">${caption}</text>
+  <circle cx="${width - 184}" cy="158" r="120" fill="${palette.primary}" opacity="0.08"/>
+  <circle cx="160" cy="${height - 124}" r="86" fill="${palette.primary}" opacity="0.06"/>
+  ${chipSvg}
+  <rect x="120" y="210" width="${width - 240}" height="430" rx="30" fill="url(#screenGlow)" stroke="${palette.border}" stroke-width="2"/>
+  <rect x="162" y="252" width="${width - 324}" height="32" rx="16" fill="${palette.primary}" fill-opacity="0.12"/>
+  <rect x="162" y="306" width="220" height="18" rx="9" fill="${palette.primary}" fill-opacity="0.18"/>
+  <rect x="398" y="306" width="160" height="18" rx="9" fill="${palette.primary}" fill-opacity="0.10"/>
+  <rect x="162" y="356" width="404" height="204" rx="24" fill="url(#heroPanel)"/>
+  <rect x="194" y="390" width="208" height="22" rx="11" fill="${palette.primary}" fill-opacity="0.18"/>
+  <rect x="194" y="434" width="154" height="18" rx="9" fill="${palette.primary}" fill-opacity="0.12"/>
+  <rect x="194" y="468" width="186" height="18" rx="9" fill="${palette.primary}" fill-opacity="0.10"/>
+  <rect x="484" y="392" width="202" height="130" rx="18" fill="#ffffff" fill-opacity="0.82" stroke="${palette.border}" stroke-width="2"/>
+  <rect x="514" y="420" width="96" height="14" rx="7" fill="${palette.primary}" fill-opacity="0.22"/>
+  <rect x="514" y="450" width="138" height="14" rx="7" fill="${palette.primary}" fill-opacity="0.14"/>
+  <rect x="514" y="480" width="76" height="28" rx="14" fill="${palette.primary}" fill-opacity="0.78"/>
+  <rect x="744" y="250" width="418" height="368" rx="28" fill="#ffffff" fill-opacity="0.88" stroke="${palette.border}" stroke-width="2"/>
+  <rect x="782" y="292" width="140" height="18" rx="9" fill="${palette.primary}" fill-opacity="0.24"/>
+  <rect x="782" y="332" width="232" height="18" rx="9" fill="${palette.primary}" fill-opacity="0.12"/>
+  <rect x="782" y="374" width="308" height="20" rx="10" fill="${palette.primary}" fill-opacity="0.10"/>
+  <rect x="782" y="426" width="330" height="118" rx="20" fill="${palette.background}" stroke="${palette.border}" stroke-width="2"/>
+  <rect x="816" y="462" width="92" height="42" rx="14" fill="${palette.primary}" fill-opacity="0.82"/>
+  <rect x="934" y="468" width="138" height="14" rx="7" fill="${palette.primary}" fill-opacity="0.16"/>
+  <rect x="934" y="494" width="112" height="14" rx="7" fill="${palette.primary}" fill-opacity="0.12"/>
+  <rect x="120" y="${height - 102}" width="${width - 240}" height="2" fill="${palette.border}"/>
 </svg>`
   }
 
@@ -162,17 +173,12 @@ function buildTemplateSvg(
         return `<circle cx="126" cy="${y}" r="10" fill="${palette.primary}"/><text x="158" y="${textY}" fill="${palette.text}" font-size="36" font-family="PingFang SC, Microsoft YaHei, sans-serif">${textSvg}</text>`
       })
       .join('')
-    const captionText = clampText(item.caption || '自动生成', 34)
-
     return `<?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">
   <rect width="${width}" height="${height}" fill="#ffffff" rx="36"/>
   <rect x="0" y="0" width="${width}" height="180" fill="${palette.background}"/>
-  <rect x="96" y="84" width="${width - 192}" height="96" fill="${palette.primary}" rx="20" opacity="0.12"/>
-  <text x="96" y="144" fill="${palette.primary}" font-size="34" font-family="PingFang SC, Microsoft YaHei, sans-serif" letter-spacing="2">关键结构</text>
   <text x="96" y="248" fill="${palette.text}" font-size="52" font-family="PingFang SC, Microsoft YaHei, sans-serif" font-weight="700">${titleTspans}</text>
   ${bulletSvg}
-  <text x="96" y="${height - 96}" fill="${palette.muted}" font-size="30" font-family="PingFang SC, Microsoft YaHei, sans-serif">${escapeXml(captionText)}</text>
 </svg>`
   }
 

@@ -1,6 +1,8 @@
 import type { AIProvider, ChatResponse } from './types'
 import type { Message, ToolDef, ChatOptions, ContentBlock } from '@/lib/ai'
 
+const OPENAI_REQUEST_TIMEOUT_MS = 900_000
+
 interface OpenAIChatMessage {
   role: 'user' | 'assistant' | 'system'
   content: string
@@ -57,15 +59,26 @@ export function createOpenAIProvider(
         ...(openaiTools ? { tools: openaiTools } : {}),
       }
 
-      const response = await fetch(`${baseURL}/chat/completions`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${apiKey}`,
-        },
-        body: JSON.stringify(body),
-        signal: AbortSignal.timeout(300000),
-      })
+      let response: Response
+      try {
+        response = await fetch(`${baseURL}/chat/completions`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${apiKey}`,
+          },
+          body: JSON.stringify(body),
+          signal: AbortSignal.timeout(OPENAI_REQUEST_TIMEOUT_MS),
+        })
+      } catch (error) {
+        if (error instanceof Error) {
+          throw new Error(
+            `OpenAI provider request failed for model "${model}" after ${OPENAI_REQUEST_TIMEOUT_MS}ms: ${error.message}`,
+          )
+        }
+        throw error
+      }
+
 
       if (!response.ok) {
         const errorText = await response.text()

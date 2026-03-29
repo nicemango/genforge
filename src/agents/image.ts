@@ -1,6 +1,11 @@
 import { createAgentProvider, type ModelConfig } from '@/lib/ai'
+import type { WritingStyleJSON } from '@/lib/json'
+import type { WechatLayoutConfig } from '@/lib/wechat-layout'
+import type { GeneratedImageAsset, ImagePlan, ImagePlanItem } from '@/lib/image-plan'
+import { listImagePlanItems, planArticleImages } from '@/lib/image-plan'
+import { generateImageWithFallback } from '@/lib/minimax-image'
+import { renderTemplateImage } from '@/lib/template-image'
 import { BaseAgent } from './base'
-import { createGenerateImageTool, generatedImagesStore } from '@/tools/generate-image'
 
 export interface ImageSuggestion {
   location: string
@@ -9,171 +14,228 @@ export interface ImageSuggestion {
 }
 
 export interface ImageAgentResult {
+  imagePlan: ImagePlan
+  assets: GeneratedImageAsset[]
   imagePlaceholders: Array<{
+    slotId: string
     marker: string
     imageBase64: string
     alt: string
     caption: string
+    imageType: ImagePlanItem['imageType']
+    renderMode: ImagePlanItem['renderMode']
+    sourcePrompt: string
+    mimeType: string
+    width?: number
+    height?: number
   }>
 }
 
-// Style presets for consistent visual language
-const STYLE_PRESETS = {
-  TECH: 'photorealistic, cinematic lighting, high contrast, sharp focus, global illumination',
-  MODERN: 'minimalist modern aesthetic, soft ambient light, clean composition, 8k quality, studio photography',
-  DYNAMIC: 'action photography style, motion blur, dramatic rim lighting, gritty realism',
+interface RunImageAgentOptions {
+  writingStyle?: WritingStyleJSON
+  layoutConfig?: WechatLayoutConfig
 }
-
-// Aspect ratio assignment per image role
-const ASPECT_RATIOS = {
-  COVER: '16:9',   // Article cover / hero image
-  INLINE: '4:3',    // Inline illustration within article body
-}
-
-// Few-shot examples with style and aspect ratio guidance
-const IMG_PROMPT_EXAMPLES = [
-  '',
-  '## 配图 Prompt 示例（封面图 16:9 — 开篇 Hook）',
-  'Prompt: Futuristic Shanghai skyline at blue hour, holographic AI data streams cascading between skyscrapers, autonomous drone swarm flying through the city, lens flare and volumetric light rays, ' + STYLE_PRESETS.TECH + ', no text, 16:9',
-  '',
-  '## 配图 Prompt 示例（章节配图 4:3 — 文中插图）',
-  'Prompt: Close-up of advanced AI chip circuitry under electron microscope, iridescent copper traces and golden solder points, shallow depth of field, ' + STYLE_PRESETS.MODERN + ', no text, 4:3',
-  '',
-  '## 配图 Prompt 示例（数据/对比图 4:3）',
-  'Prompt: Split screen: elderly Chinese factory worker on left reviewing handwritten notes, young engineer on right controlling robotic arm via tablet, warm vs cool tone contrast, ' + STYLE_PRESETS.DYNAMIC + ', cinematic composition, no text, 4:3',
-  '',
-  '## 配图 Prompt 示例（人物场景 16:9）',
-  'Prompt: Young Chinese AI researcher in a modern lab, neural network visualization screens reflecting on her glasses, purple and blue accent lighting, ' + STYLE_PRESETS.MODERN + ', confident expression, no text, 16:9',
-].join('\n')
-
-const SYSTEM_PROMPT = [
-  '你是「科技猫」公众号的资深配图编辑，为科技/AI类文章设计高质量配图方案。',
-  '品牌调性：科技感、写实摄影、有画面张力。不要抽象概念图，要具象有冲击力的视觉。',
-  '',
-  '## 风格预设（可组合使用）',
-  `TECH:   ${STYLE_PRESETS.TECH}`,
-  `MODERN: ${STYLE_PRESETS.MODERN}`,
-  `DYNAMIC: ${STYLE_PRESETS.DYNAMIC}`,
-  '',
-  '## 图片比例规则',
-  `封面图（文章顶部第一张）：${ASPECT_RATIOS.COVER}，强调大气、冲击力`,
-  `文中插图（每个章节）：${ASPECT_RATIOS.INLINE}，强调细节、可读性`,
-  '',
-  '## 工作流程',
-  '',
-  '1. 分析文章：识别标题关键词情感 + 3-4 个关键章节',
-  '2. 封面图 Prompt：以文章标题核心词为中心，构造宏大场景，增强视觉冲击力',
-  '   例如：标题含"AI芯片"→ 芯片微观+宏观城市结合画面',
-  '3. 章节配图 Prompt：紧扣章节主题，融入科技元素，用 ${STYLE_PRESETS.MODERN} 风格',
-  '4. 调用 generate_image 工具生成，传入对应 aspectRatio：封面用 16:9，章节用 4:3',
-  '5. 嵌入文章：在配图位置插入 __IMG_ID_X__ 占位符标记',
-  '',
-  '## 配图数量',
-  '一篇 2000 字文章：封面 1 张（16:9）+ 章节 2-3 张（4:3），共 3-4 张',
-  '',
-  '## 图片 Prompt 规范',
-  IMG_PROMPT_EXAMPLES,
-  '',
-  '禁止：人脸特写、文字图表、过于抽象的纯概念图',
-  '推荐：AI芯片、服务器机房、办公场景、产品展示、数据可视化',
-  '',
-  '## 输出格式',
-  '',
-  '分析完成后，先描述配图计划（标注每张图的 role + aspect ratio），然后逐个调用工具生成。',
-  '每张配图生成后，用 __IMG_ID_X__ 占位符标记（X 是工具返回的 imageIds 中的值）。',
-  '示例：__IMG_ID_IMG_0__',
-  '生成完整后，输出"配图完成：X 张图片已生成"。',
-].join('\n')
 
 export async function runImageAgent(
   articleTitle: string,
   articleBody: string,
-  apiKey: string,
+  apiKey: string | undefined,
   modelConfig: ModelConfig,
+  options: RunImageAgentOptions = {},
 ): Promise<ImageAgentResult> {
-  // Clear store at function scope to avoid stale image data from previous runs
-  generatedImagesStore.clear()
+  const rulePlan = planArticleImages(articleTitle, articleBody, options)
+  const imagePlan = await enrichImagePlan(rulePlan, articleTitle, articleBody, modelConfig)
+  const assets = await materializeImagePlan(imagePlan, apiKey)
 
-  const provider = createAgentProvider('image', modelConfig)
-
-  const agent = new BaseAgent(provider, { maxSteps: 12 })
-  agent.registerTool(createGenerateImageTool(apiKey))
-
-  const task = [
-    '请为以下微信公众号文章设计并生成配图。',
-    '',
-    '## 文章标题',
-    articleTitle,
-    '',
-    '## 文章正文',
-    articleBody.slice(0, 2000),
-    '',
-    '## 要求',
-    '1. 分析文章标题和结构，确定 1 个封面位置 + 2-3 个章节位置',
-    '2. 为封面图写一个有视觉冲击力的 Prompt（16:9），突出文章核心概念',
-    '3. 为每个章节图写一个细节丰富的 Prompt（4:3），紧扣章节主题',
-    '4. 调用 generate_image 工具生成图片，传入正确的 aspectRatio：',
-    '   - 封面/开篇图：aspectRatio="16:9"',
-    '   - 章节插图：aspectRatio="4:3"',
-    '5. 在配图位置用 __IMG_ID_X__ 占位符替换（X 为 imageIds 中的值），',
-    '   例如：__IMG_ID_IMG_0__',
-    '   不要用 ![描述](data:image/jpeg;base64,...) 格式',
-    '6. 总结：配图完成：X 张图片已生成（含封面 N 张，章节 M 张）',
-  ].join('\n')
-
-  const result = await agent.run(task, {
-    temperature: 0.4,
-    maxTokens: 8000,
-    systemPrompt: SYSTEM_PROMPT,
-  })
-
-  const placeholders = extractImagePlaceholders(result.output)
-
-  // Validate: count ![...](cover) placeholders in the original article body
-  const expectedCount = (articleBody.match(/!\[[^\]]*\]\(cover\)/g) ?? []).length
-  if (expectedCount > 0 && placeholders.length < expectedCount) {
-    console.warn(
-      `[ImageAgent] Generated ${placeholders.length} images but article has ${expectedCount} placeholders. Some placeholders will remain unreplaced.`,
-    )
+  return {
+    imagePlan,
+    assets,
+    imagePlaceholders: assets
+      .filter((asset): asset is GeneratedImageAsset & { imageBase64: string } => Boolean(asset.imageBase64))
+      .map((asset) => ({
+        slotId: asset.slotId,
+        marker: asset.marker,
+        imageBase64: asset.imageBase64,
+        alt: asset.alt,
+        caption: asset.caption,
+        imageType: asset.imageType,
+        renderMode: asset.renderMode,
+        sourcePrompt: asset.sourcePrompt ?? '',
+        mimeType: asset.mimeType,
+        width: asset.width,
+        height: asset.height,
+      })),
   }
-
-  return { imagePlaceholders: placeholders }
 }
 
-function extractImagePlaceholders(
-  output: string,
-): Array<{ marker: string; imageBase64: string; alt: string; caption: string }> {
-  const results: Array<{ marker: string; imageBase64: string; alt: string; caption: string }> = []
-
-  // Match __IMG_ID_X__ markers (base64 stored in tool's generatedImagesStore)
-  // Use [a-zA-Z0-9_]+ instead of \w+ to avoid matching Chinese alt text as IDs.
-  const idRegex = /__IMG_ID_([a-zA-Z0-9_]+)__/g
-  let match
-  const seenIds = new Set<string>()
-
-  while ((match = idRegex.exec(output)) !== null) {
-    const imgId = match[1]
-    if (seenIds.has(imgId)) continue
-    seenIds.add(imgId)
-
-    const imageBase64 = generatedImagesStore.get(imgId)
-    if (!imageBase64) continue
-
-    const marker = match[0]
-    const caption = imgId
-    const alt = `配图 ${results.length + 1}`
-
-    results.push({ marker, imageBase64, alt, caption })
+async function enrichImagePlan(
+  rulePlan: ImagePlan,
+  articleTitle: string,
+  articleBody: string,
+  modelConfig: ModelConfig,
+): Promise<ImagePlan> {
+  const aiItems = listImagePlanItems(rulePlan).filter((item) => item.renderMode === 'ai')
+  const hasModelAuth = Boolean(modelConfig.apiKey || process.env.DEFAULT_AI_API_KEY)
+  if (aiItems.length === 0 || !hasModelAuth) {
+    return rulePlan
   }
 
-  // Also match inline ![alt](data:image/jpeg;base64,xxx) patterns (fallback)
-  const inlineRegex = /!\[([^\]]*)\]\(data:image\/jpeg;base64,([^)]+)\)/g
-  while ((match = inlineRegex.exec(output)) !== null) {
-    const alt = match[1]?.trim() || '配图'
-    const imageBase64 = match[2]
-    const marker = match[0]
-    results.push({ marker, imageBase64, alt, caption: alt })
+  try {
+    const provider = createAgentProvider('image', modelConfig)
+    const agent = new BaseAgent(provider, { maxSteps: 2 })
+    const task = [
+      '你是中文公众号配图策划编辑。请只返回 JSON，不要返回解释。',
+      '',
+      '你会收到一篇文章和一组已存在的 imagePlan 草案。',
+      '请只优化 renderMode=ai 的 prompt 和 caption，保留 slotId，不要新增或删除项目。',
+      'caption 要简短中文，prompt 要适合写实科技类或内容型封面，不要有英文大字，不要水印。',
+      '',
+      '返回格式：',
+      '{"items":[{"slotId":"cover","prompt":"...","caption":"..."}]}',
+      '',
+      `文章标题：${articleTitle}`,
+      `文章摘要：${articleBody.slice(0, 1200)}`,
+      `草案：${JSON.stringify(aiItems.map((item) => ({ slotId: item.slotId, prompt: item.prompt, caption: item.caption, sectionTitle: item.sectionTitle })))}`,
+    ].join('\n')
+
+    const result = await agent.run(task, {
+      temperature: 0.3,
+      maxTokens: 2400,
+      systemPrompt: '你只输出合法 JSON。',
+    })
+
+    const parsed = parseJsonObject<{ items?: Array<{ slotId: string; prompt?: string; caption?: string }> }>(result.output)
+    if (!parsed?.items?.length) {
+      return rulePlan
+    }
+
+    const patchMap = new Map(parsed.items.map((item) => [item.slotId, item]))
+    return {
+      ...rulePlan,
+      cover: rulePlan.cover
+        ? {
+            ...rulePlan.cover,
+            prompt: patchMap.get(rulePlan.cover.slotId)?.prompt?.trim() || rulePlan.cover.prompt,
+            caption: patchMap.get(rulePlan.cover.slotId)?.caption?.trim() || rulePlan.cover.caption,
+          }
+        : undefined,
+      items: rulePlan.items.map((item) => ({
+        ...item,
+        prompt: patchMap.get(item.slotId)?.prompt?.trim() || item.prompt,
+        caption: patchMap.get(item.slotId)?.caption?.trim() || item.caption,
+      })),
+    }
+  } catch (error) {
+    console.warn(`[ImageAgent] Prompt enrichment skipped: ${error instanceof Error ? error.message : String(error)}`)
+    return rulePlan
+  }
+}
+
+async function materializeImagePlan(plan: ImagePlan, apiKey: string | undefined): Promise<GeneratedImageAsset[]> {
+  const results: GeneratedImageAsset[] = []
+
+  for (const item of listImagePlanItems(plan)) {
+    if (item.renderMode === 'template') {
+      const templateAsset = await materializeTemplateItem(item, plan.themeId)
+      results.push(templateAsset)
+      continue
+    }
+
+    const aiAsset = await materializeAiItem(item, apiKey, plan.themeId)
+    results.push(aiAsset)
   }
 
   return results
+}
+
+async function materializeAiItem(
+  item: ImagePlanItem,
+  apiKey: string | undefined,
+  themeId: WechatLayoutConfig['themeId'],
+): Promise<GeneratedImageAsset> {
+  if (!apiKey || apiKey.trim() === '') {
+    console.warn(`[ImageAgent] MiniMax API key is missing, using template fallback for ${item.slotId}.`)
+    return materializeTemplateItem(
+      {
+        ...item,
+        imageType: item.imageType === 'cover-hero' ? 'cover-hero' : 'section-card',
+        renderMode: 'template',
+        coverMode: item.imageType === 'cover-hero' ? 'template' : item.coverMode,
+        caption: `${item.sectionTitle || item.alt}｜模板降级`,
+      },
+      themeId ?? 'wechat-pro',
+      'MiniMax API key is missing',
+    )
+  }
+
+  const generated = await generateImageWithFallback(apiKey, {
+    prompt: item.prompt,
+    aspectRatio: item.aspectRatio,
+    responseFormat: 'base64',
+  })
+
+  if (generated.imageBase64) {
+    return {
+      slotId: item.slotId,
+      marker: item.marker,
+      alt: item.alt,
+      caption: item.caption,
+      imageType: item.imageType,
+      renderMode: item.renderMode,
+      coverMode: item.coverMode,
+      mimeType: 'image/jpeg',
+      imageBase64: generated.imageBase64,
+      sourcePrompt: item.prompt,
+      qualityStatus: 'passed',
+    }
+  }
+
+  console.warn(`[ImageAgent] AI image failed for ${item.slotId}, falling back to template card.`)
+  return materializeTemplateItem(
+    {
+      ...item,
+      imageType: item.slotId === 'cover' ? 'cover-hero' : 'section-card',
+      renderMode: 'template',
+      coverMode: item.slotId === 'cover' ? 'template' : item.coverMode,
+      caption: `${item.sectionTitle || item.alt}｜自动降级卡片`,
+    },
+    themeId ?? 'wechat-pro',
+    'AI image generation failed',
+  )
+}
+
+async function materializeTemplateItem(
+  item: ImagePlanItem,
+  themeId: WechatLayoutConfig['themeId'],
+  fallbackReason?: string,
+): Promise<GeneratedImageAsset> {
+  const rendered = await renderTemplateImage(item, themeId ?? 'wechat-pro')
+  return {
+    slotId: item.slotId,
+    marker: item.marker,
+    alt: item.alt,
+    caption: item.caption,
+    imageType: item.imageType,
+    renderMode: item.renderMode,
+    coverMode: item.coverMode,
+    mimeType: rendered.mimeType,
+    imageBase64: rendered.imageBase64,
+    width: rendered.width,
+    height: rendered.height,
+    sourcePrompt: item.prompt,
+    qualityStatus: fallbackReason ? 'downgraded' : 'passed',
+    fallbackReason,
+  }
+}
+
+function parseJsonObject<T>(value: string): T | null {
+  const fencedMatch = value.match(/```(?:json)?\s*([\s\S]+?)```/)
+  const candidate = fencedMatch?.[1] ?? value
+  const objectMatch = candidate.match(/\{[\s\S]+\}/)
+  const jsonText = objectMatch?.[0] ?? candidate
+  try {
+    return JSON.parse(jsonText) as T
+  } catch {
+    return null
+  }
 }

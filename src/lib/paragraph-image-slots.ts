@@ -1,37 +1,79 @@
+interface ParsedSection {
+  heading?: string
+  bodyLines: string[]
+}
+
+interface ParagraphCandidate {
+  startLine: number
+  endLine: number
+  text: string
+  score: number
+}
+
 export function normalizeParagraphImageSlots(markdown: string): string {
-  const sections = splitSections(markdown)
+  const sections = parseSections(markdown)
   let paraCounter = 1
+  let insertedCount = 0
 
-  const normalizedSections = sections.map((section, sectionIndex) => {
-    if (sectionIndex === 0) {
-      return normalizeIntroSection(section)
+  const normalizedSections = sections.map((section, index) => {
+    if (index === 0 && !section.heading) {
+      return normalizeIntroSection(section.bodyLines.join('\n'))
     }
 
-    const lines = section.split('\n')
-    const heading = lines[0] ?? ''
-    const bodyLines = lines.slice(1)
-    const bodyWithoutPlaceholders = bodyLines.filter((line) => !isImagePlaceholderLine(line))
-    const paragraphs = collectParagraphCandidates(bodyWithoutPlaceholders)
-
-    if (paragraphs.length === 0) {
-      return [heading, ...bodyWithoutPlaceholders].join('\n')
+    if (!section.heading) {
+      return section.bodyLines.join('\n')
     }
 
-    const bestParagraph = scoreParagraphs(paragraphs)[0]
-    const insertAfterLine = bestParagraph.endLine
+    const bodyWithoutPlaceholders = section.bodyLines.filter((line) => !isImagePlaceholderLine(line))
+    const rankedParagraphs = collectParagraphCandidates(bodyWithoutPlaceholders)
+      .map((candidate, candidateIndex, all) => ({
+        ...candidate,
+        score: scoreParagraph(candidate.text, candidateIndex, all.length),
+      }))
+      .sort((a, b) => b.score - a.score)
+
+    const selected = rankedParagraphs.find((candidate) => candidate.score >= 4)
+      ?? rankedParagraphs.find(
+        (candidate) =>
+          candidate.text.trim().length >= 50 &&
+          !isRhetoricalParagraph(candidate.text) &&
+          !isClosingStyleParagraph(candidate.text),
+      )
+
+    if (!selected || insertedCount >= 3) {
+      return [section.heading, ...bodyWithoutPlaceholders].join('\n')
+    }
+
     const nextLines = [...bodyWithoutPlaceholders]
-    nextLines.splice(insertAfterLine + 1, 0, '', `![段落配图，视觉化核心](image:para-${paraCounter++})`)
+    nextLines.splice(selected.endLine + 1, 0, '', `![段落配图，视觉化核心](image:para-${paraCounter++})`)
+    insertedCount += 1
 
-    return [heading, ...nextLines].join('\n')
+    return [section.heading, ...nextLines].join('\n')
   })
 
   let normalized = normalizedSections.join('\n\n').replace(/\n{3,}/g, '\n\n').trim()
-
   if (!/\(image:para-\d+\)/.test(normalized)) {
     normalized = insertFallbackParagraphSlot(normalized)
   }
-
   return normalized
+}
+
+function parseSections(markdown: string): ParsedSection[] {
+  const lines = markdown.trim().split('\n')
+  const sections: ParsedSection[] = []
+  let current: ParsedSection = { bodyLines: [] }
+
+  for (const line of lines) {
+    if (/^##\s+/.test(line.trim())) {
+      sections.push(current)
+      current = { heading: line.trim(), bodyLines: [] }
+      continue
+    }
+    current.bodyLines.push(line)
+  }
+
+  sections.push(current)
+  return sections.filter((section) => section.heading || section.bodyLines.some((line) => line.trim()))
 }
 
 function normalizeIntroSection(section: string): string {
@@ -49,7 +91,7 @@ function normalizeIntroSection(section: string): string {
     }
 
     normalizedLines.push(line)
-    if (!coverInserted && /^#\s+/.test(line)) {
+    if (!coverInserted && /^#\s+/.test(line.trim())) {
       normalizedLines.push('', '![开篇配图，有画面感](image:cover)')
       coverInserted = true
     }
@@ -62,22 +104,12 @@ function normalizeIntroSection(section: string): string {
   return normalizedLines.join('\n')
 }
 
-function splitSections(markdown: string): string[] {
-  return markdown.split(/\n(?=##\s+)/g)
-}
-
 function isImagePlaceholderLine(line: string): boolean {
   return /!\[[^\]]*\]\(image:(?:cover|section-\d+|para-\d+)\)/.test(line.trim())
 }
 
-interface ParagraphCandidate {
-  startLine: number
-  endLine: number
-  text: string
-}
-
-function collectParagraphCandidates(lines: string[]): ParagraphCandidate[] {
-  const paragraphs: ParagraphCandidate[] = []
+function collectParagraphCandidates(lines: string[]): Array<Omit<ParagraphCandidate, 'score'>> {
+  const paragraphs: Array<Omit<ParagraphCandidate, 'score'>> = []
   let start = -1
   let buffer: string[] = []
 
@@ -111,28 +143,21 @@ function collectParagraphCandidates(lines: string[]): ParagraphCandidate[] {
   return paragraphs
 }
 
-function scoreParagraphs(paragraphs: ParagraphCandidate[]): ParagraphCandidate[] {
-  return paragraphs
-    .map((paragraph, index) => ({
-      paragraph,
-      score: scoreParagraph(paragraph.text, index, paragraphs.length),
-    }))
-    .sort((a, b) => b.score - a.score)
-    .map((item) => item.paragraph)
-}
-
 function scoreParagraph(text: string, index: number, total: number): number {
+  const normalized = text.trim()
   const baseScore =
-    (/(对比|步骤|结论|原因|结构|默认|设置|权限|规则|平台|信号|层|行业)/.test(text) ? 4 : 0) +
-    (/(GitHub|Copilot|OpenAI|Meta|模型|平台|训练|开发者|代码|仓库)/i.test(text) ? 3 : 0) +
-    (/(?:\d+[%亿元万千]|\d+\.\d+)/.test(text) ? 2 : 0) +
-    Math.min(3, Math.floor(text.length / 80))
+    (/(对比|步骤|结论|原因|结构|默认|设置|权限|规则|平台|信号|层|行业|路径|选项|流程|分层)/.test(normalized) ? 3 : 0) +
+    (/(GitHub|Copilot|OpenAI|Meta|模型|平台|训练|开发者|代码|仓库|协议|条款|许可证|benchmark|论文)/i.test(normalized) ? 2 : 0) +
+    (/(?:\d+[%亿元万千]|\d+\.\d+)/.test(normalized) ? 2 : 0) +
+    Math.min(2, Math.floor(normalized.length / 120))
 
   const isLastParagraph = index === total - 1
-  const lastParagraphPenalty = isLastParagraph && isClosingStyleParagraph(text) ? 4 : 0
+  const lastParagraphPenalty = isLastParagraph && isClosingStyleParagraph(normalized) ? 4 : 0
+  const shortParagraphPenalty = normalized.length < 50 ? 3 : 0
+  const rhetoricalPenalty = isRhetoricalParagraph(normalized) ? 4 : 0
   const positionBonus = !isLastParagraph ? 1 : 0
 
-  return baseScore + positionBonus - lastParagraphPenalty
+  return baseScore + positionBonus - lastParagraphPenalty - shortParagraphPenalty - rhetoricalPenalty
 }
 
 function isBlockquoteParagraph(text: string): boolean {
@@ -143,16 +168,34 @@ function isClosingStyleParagraph(text: string): boolean {
   return /^(这才是|真正值得警惕|最值得警惕|归根结底|说到底|最终|最后|本质上|换句话说)/.test(text.trim())
 }
 
-function insertFallbackParagraphSlot(markdown: string): string {
-  const lines = markdown.split('\n')
-  const paragraphs = collectParagraphCandidates(lines)
+function isRhetoricalParagraph(text: string): boolean {
+  return /(你知道吗|你品品|换句话说|说白了|你想啊|更重要的是|这不是危言耸听|这背后是|为什么|还能信任什么)[？?]?$/.test(text.trim())
+}
 
-  const candidate = paragraphs.find((paragraph) => paragraph.text.length >= 60)
-  if (!candidate) {
-    return markdown
+function insertFallbackParagraphSlot(markdown: string): string {
+  const sections = parseSections(markdown)
+  for (let index = 1; index < sections.length; index += 1) {
+    const section = sections[index]
+    if (!section.heading) continue
+    const candidates = collectParagraphCandidates(section.bodyLines)
+    const fallback = candidates.find(
+      (candidate) =>
+        candidate.text.trim().length >= 50 &&
+        !isRhetoricalParagraph(candidate.text) &&
+        !isClosingStyleParagraph(candidate.text),
+    )
+    if (!fallback) continue
+
+    const nextLines = [...section.bodyLines]
+    nextLines.splice(fallback.endLine + 1, 0, '', '![段落配图，视觉化核心](image:para-1)')
+    const nextSections = [...sections]
+    nextSections[index] = { ...section, bodyLines: nextLines }
+    return nextSections
+      .map((item) => (item.heading ? [item.heading, ...item.bodyLines].join('\n') : item.bodyLines.join('\n')))
+      .join('\n\n')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim()
   }
 
-  const fallbackLines = [...lines]
-  fallbackLines.splice(candidate.endLine + 1, 0, '', '![段落配图，视觉化核心](image:para-1)')
-  return fallbackLines.join('\n').replace(/\n{3,}/g, '\n\n').trim()
+  return markdown
 }

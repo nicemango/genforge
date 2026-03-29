@@ -8,21 +8,24 @@ datasource db {
 }
 
 model Account {
-  id           String   @id @default(cuid())
-  name         String
-  isActive     Boolean  @default(true)
-  modelConfig  String   @default("{}")
-  writingStyle String   @default("{}")
-  wechatConfig String   @default("{}")
-  qualityConfig String @default("{\"minScore\":7.0,\"maxWriteRetries\":2}") // {minScore, maxWriteRetries}
-  createdAt    DateTime @default(now())
-  updatedAt    DateTime @updatedAt
+  id                     String   @id @default(cuid())
+  name                   String
+  isActive               Boolean  @default(true)
+  modelConfig            String   @default("{}")
+  writingStyle           String   @default("{}")
+  wechatConfig           String   @default("{}")
+  juejinConfig           String   @default("{}")
+  defaultPublishPlatform String   @default("wechat")
+  qualityConfig          String   @default("{\"minScore\":7.0,\"maxWriteRetries\":2}") // {minScore, maxWriteRetries}
+  createdAt              DateTime @default(now())
+  updatedAt              DateTime @updatedAt
 
-  contents  Content[]
-  topics    Topic[]
-  taskRuns  TaskRun[]
-  schedules ScheduledTask[]
+  contents       Content[]
+  topics         Topic[]
+  taskRuns       TaskRun[]
+  schedules      ScheduledTask[]
   qualityRecords QualityRecord[]
+  wallpapers     Wallpaper[]
 }
 
 model Topic {
@@ -34,6 +37,12 @@ model Topic {
   summary   String      @default("")
   sources   String      @default("[]")
   heatScore Float       @default(0)
+  // V2 新增字段
+  valueScore        Float       @default(0)    // 价值洼地评分
+  redSeaLevel       String      @default("MEDIUM") // LOW | MEDIUM | HIGH
+  contrarianAngle   String      @default("")   // 反共识策略说明
+  timeToMainstream  String      @default("WEEKS") // NOW | WEEKS | MONTHS
+  selectionStrategy String      @default("")   // VALUE_CREVASSE | EARLY_SIGNAL | CONTRARIAN
   tags      String      @default("[]")
   status    TopicStatus @default(PENDING)
   createdAt DateTime    @default(now())
@@ -52,22 +61,24 @@ enum TopicStatus {
 }
 
 model Content {
-  id            String        @id @default(cuid())
-  accountId     String
-  account       Account       @relation(fields: [accountId], references: [id], onDelete: Cascade)
-  topicId       String?
-  topic         Topic?        @relation(fields: [topicId], references: [id], onDelete: SetNull)
-  title         String        @default("")
-  body          String        @default("")
-  summary       String        @default("")
-  wordCount     Int           @default(0)
-  status        ContentStatus @default(DRAFT)
-  reviewNotes   String        @default("")
-  images        String        @default("[]") // JSON array of {alt, caption, base64}
-  wechatMediaId String?
-  publishedAt   DateTime?
-  createdAt     DateTime      @default(now())
-  updatedAt     DateTime      @updatedAt
+  id                  String        @id @default(cuid())
+  accountId           String
+  account             Account       @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  topicId             String?
+  topic               Topic?        @relation(fields: [topicId], references: [id], onDelete: SetNull)
+  title               String        @default("")
+  body                String        @default("")
+  summary             String        @default("")
+  wordCount           Int           @default(0)
+  status              ContentStatus @default(DRAFT)
+  reviewNotes         String        @default("")
+  images              String        @default("[]") // JSON array of {alt, caption, base64}
+  writerPromptVersion String        @default("")
+  wechatMediaId       String?
+  publishRecords      String        @default("[]") // JSON array of publish records
+  publishedAt         DateTime?
+  createdAt           DateTime      @default(now())
+  updatedAt           DateTime      @updatedAt
 
   @@index([accountId, status])
 }
@@ -93,7 +104,13 @@ model TaskRun {
   startedAt  DateTime  @default(now())
   finishedAt DateTime?
 
+  /** Parent TaskRun ID. Non-null for steps run as part of a FULL_PIPELINE. */
+  parentRunId String?
+  parent      TaskRun?  @relation("TaskRunChildren", fields: [parentRunId], references: [id], onDelete: SetNull)
+  children    TaskRun[] @relation("TaskRunChildren")
+
   @@index([accountId, taskType])
+  @@index([parentRunId])
 
   verificationReports VerificationReport[]
 }
@@ -143,9 +160,10 @@ model QualityRecord {
   issues         String   @default("[]") // JSON array of issue strings
   suggestions    String   @default("[]") // JSON array of suggestion strings
   wordCount      Int      @default(0)
-  imageCount     Int      @default(0)
-  writeAttempts  Int      @default(1) // How many write attempts before passing
-  createdAt      DateTime @default(now())
+  imageCount           Int      @default(0)
+  writeAttempts        Int      @default(1) // How many write attempts before passing
+  writerPromptVersion  String   @default("") // Version of writer prompt used
+  createdAt            DateTime @default(now())
 
   @@index([accountId, createdAt])
 }
@@ -188,4 +206,38 @@ model RssSource {
 
   @@index([accountId, isEnabled])
   @@index([category, isEnabled])
+}
+
+// 壁纸生成任务和结果
+model Wallpaper {
+  id            String          @id @default(cuid())
+  accountId     String?
+  account       Account?        @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  name          String          // 壁纸名称/主题
+  prompt        String          // 生成提示词
+  aspectRatio   String          @default("9:16") // 1:1, 16:9, 9:16, 4:3, 3:4
+  status        WallpaperStatus @default(PENDING)
+  imageUrl      String?         // 生成的图片路径/URL
+  fileSize      Int?            // 文件大小(bytes)
+  width         Int?            // 图片宽度
+  height        Int?            // 图片高度
+  tags          String          @default("[]") // JSON array of tags
+  isFavorite    Boolean         @default(false)
+  downloadCount Int             @default(0)
+  error         String?         // 错误信息
+  taskRunId     String?         // 关联的任务运行ID
+  generatedAt   DateTime?
+  createdAt     DateTime        @default(now())
+  updatedAt     DateTime        @updatedAt
+
+  @@index([accountId, status])
+  @@index([accountId, isFavorite])
+  @@index([createdAt])
+}
+
+enum WallpaperStatus {
+  PENDING    // 等待生成
+  GENERATING // 生成中
+  COMPLETED  // 已完成
+  FAILED     // 失败
 }

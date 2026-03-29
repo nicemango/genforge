@@ -16,14 +16,11 @@ interface WriteExpertInput {
   topic: TopicSuggestion
 }
 
-interface WriteExpertOutput {
-  title?: string
-  body: string
-  summary?: string
-  wordCount?: number
-  /** 维度评分（可选，由 ReviewAgent 提供时使用） */
+interface WriteExpertOutput extends Partial<WriterResult> {
+  contentId?: string
+  /** 维度评分（兼容旧格式，由 ReviewAgent 提供时使用） */
   dimensionScores?: DimensionScores
-  /** 审核评分（可选） */
+  /** 审核评分（兼容旧格式） */
   score?: number
 }
 
@@ -83,8 +80,8 @@ export class WriteExpert implements ExpertSkill {
     }
 
     const out = output as Partial<WriteExpertOutput>
+    issues.push(...this.validateStructuredWriterResult(out))
 
-    // 验证 body 存在且是字符串
     if (!out.body || typeof out.body !== 'string') {
       issues.push('output.body 必须存在且是字符串')
       return {
@@ -98,27 +95,39 @@ export class WriteExpert implements ExpertSkill {
       issues.push('output.body 不能为空字符串')
     }
 
-    // 验证字数 2000-2800（允许 ±10% 容差，即 1800-3080）
+    if (!this.isNonEmptyString(out.title)) {
+      issues.push('output.title 必须存在且是非空字符串')
+    }
+
+    if (!this.isNonEmptyString(out.summary)) {
+      warnings.push('output.summary 为空或缺失')
+    }
+
+    if (typeof out.wordCount !== 'number') {
+      issues.push('output.wordCount 必须存在且是数字')
+    }
+
     const wordCount = this.countChineseWords(out.body)
-    if (wordCount < 1800) {
-      issues.push(`文章字数不足：当前 ${wordCount} 字，要求至少 1800 字（容差下限）`)
-    } else if (wordCount > 3080) {
+    if (wordCount < 2000) {
+      issues.push(`文章字数不足：当前 ${wordCount} 字，要求至少 2000 字`)
+    } else if (wordCount > 2800) {
       warnings.push(`文章字数偏多：当前 ${wordCount} 字，建议控制在 2800 字以内`)
     }
 
-    // 验证无空洞开场
+    if (typeof out.wordCount === 'number' && Math.abs(out.wordCount - wordCount) > 20) {
+      warnings.push(`output.wordCount(${out.wordCount}) 与正文估算字数(${wordCount})差异较大`)
+    }
+
     const firstParagraph = this.extractFirstParagraph(out.body)
     if (this.hasEmptyOpening(firstParagraph)) {
       issues.push('文章以空洞套话开场（如"随着XX发展""近年来XX"），不符合品牌写作规范')
     }
 
-    // 验证无废话结尾
     const lastParagraph = this.extractLastParagraph(out.body)
     if (this.hasRedundantEnding(lastParagraph)) {
       issues.push('文章以废话套话结尾（如"感谢阅读""综上所述"），不符合品牌写作规范')
     }
 
-    // 验证 4 个维度评分各 >= 7
     if (out.dimensionScores) {
       const scores = out.dimensionScores
       if (scores.perspective < 7) {
@@ -135,19 +144,16 @@ export class WriteExpert implements ExpertSkill {
       }
     }
 
-    // 内容充实度检查
     const sectionCount = (out.body.match(/^##\s+/gm) ?? []).length
     if (sectionCount < 2) {
       warnings.push(`文章章节数偏少：当前 ${sectionCount} 个，建议至少 3 个章节`)
     }
 
-    // 数据支撑检查
     const dataPoints = this.countDataPoints(out.body)
     if (dataPoints < 3) {
       warnings.push(`文章数据点偏少：当前 ${dataPoints} 处，建议至少 5 处具体数据`)
     }
 
-    // 章节标题质量检查
     const descriptiveTitles = this.findDescriptiveTitles(out.body)
     if (descriptiveTitles.length > 0) {
       warnings.push(`发现描述性章节标题：${descriptiveTitles.join('、')}，建议改为观点句`)
@@ -208,9 +214,171 @@ export class WriteExpert implements ExpertSkill {
     }
   }
 
+  private isNonEmptyString(value: unknown): value is string {
+    return typeof value === 'string' && value.trim().length > 0
+  }
+
+  private hasValidScoreRound(
+    score: Partial<WriterResult['scores'][number]> | undefined,
+  ): score is WriterResult['scores'][number] {
+    if (!score || typeof score !== 'object') return false
+
+    const metrics = score.metrics
+    if (!metrics || typeof metrics !== 'object') return false
+
+    return (
+      typeof score.attempt === 'number' &&
+      Array.isArray(score.issues) &&
+      Array.isArray(score.optimizations) &&
+      typeof score.passed === 'boolean' &&
+      typeof metrics.engagement === 'number' &&
+      typeof metrics.realism === 'number' &&
+      typeof metrics.emotion === 'number' &&
+      typeof metrics.value === 'number'
+    )
+  }
+
+  private validateStructuredWriterResult(out: Partial<WriteExpertOutput>): string[] {
+    const issues: string[] = []
+    const hasStructuredFields =
+      out.outline !== undefined ||
+      out.draft !== undefined ||
+      out.rewrite !== undefined ||
+      out.final !== undefined ||
+      out.scores !== undefined
+
+    if (!hasStructuredFields) {
+      return issues
+    }
+
+    if (!out.outline || typeof out.outline !== 'object') {
+      issues.push('缺少 output.outline 或类型错误')
+    } else {
+      if (!Array.isArray(out.outline.titles) || out.outline.titles.length !== 3) {
+        issues.push('output.outline.titles 必须是长度为 3 的数组')
+      }
+      if (!this.isNonEmptyString(out.outline.hook)) {
+        issues.push('output.outline.hook 必须是非空字符串')
+      }
+      if (!Array.isArray(out.outline.sections) || out.outline.sections.length < 3) {
+        issues.push('output.outline.sections 至少包含 3 个章节')
+      } else {
+        for (const [index, section] of out.outline.sections.entries()) {
+          if (!section || typeof section !== 'object') {
+            issues.push(`output.outline.sections[${index}] 类型错误`)
+            continue
+          }
+          if (!this.isNonEmptyString(section.title)) {
+            issues.push(`output.outline.sections[${index}].title 必须是非空字符串`)
+          }
+          if (!this.isNonEmptyString(section.corePoint)) {
+            issues.push(`output.outline.sections[${index}].corePoint 必须是非空字符串`)
+          }
+        }
+      }
+      if (!this.isNonEmptyString(out.outline.ending)) {
+        issues.push('output.outline.ending 必须是非空字符串')
+      }
+    }
+
+    if (!Array.isArray(out.draft) || out.draft.length === 0) {
+      issues.push('output.draft 必须是非空数组')
+    } else {
+      for (const [index, item] of out.draft.entries()) {
+        if (!item || typeof item !== 'object') {
+          issues.push(`output.draft[${index}] 类型错误`)
+          continue
+        }
+        if (!this.isNonEmptyString(item.sectionTitle)) {
+          issues.push(`output.draft[${index}].sectionTitle 必须是非空字符串`)
+        }
+        if (!this.isNonEmptyString(item.content)) {
+          issues.push(`output.draft[${index}].content 必须是非空字符串`)
+        }
+      }
+    }
+
+    if (!Array.isArray(out.rewrite) || out.rewrite.length === 0) {
+      issues.push('output.rewrite 必须是非空数组')
+    } else {
+      for (const [index, item] of out.rewrite.entries()) {
+        if (!item || typeof item !== 'object') {
+          issues.push(`output.rewrite[${index}] 类型错误`)
+          continue
+        }
+        if (!this.isNonEmptyString(item.sectionTitle)) {
+          issues.push(`output.rewrite[${index}].sectionTitle 必须是非空字符串`)
+        }
+        if (!this.isNonEmptyString(item.emotional)) {
+          issues.push(`output.rewrite[${index}].emotional 必须是非空字符串`)
+        }
+        if (!this.isNonEmptyString(item.rational)) {
+          issues.push(`output.rewrite[${index}].rational 必须是非空字符串`)
+        }
+        if (!this.isNonEmptyString(item.casual)) {
+          issues.push(`output.rewrite[${index}].casual 必须是非空字符串`)
+        }
+        if (!['emotional', 'rational', 'casual'].includes(item.selectedStyle)) {
+          issues.push(`output.rewrite[${index}].selectedStyle 非法：${String(item.selectedStyle)}`)
+        }
+      }
+    }
+
+    if (!out.final || typeof out.final !== 'object') {
+      issues.push('缺少 output.final 或类型错误')
+    } else {
+      if (!this.isNonEmptyString(out.final.title)) {
+        issues.push('output.final.title 必须是非空字符串')
+      }
+      if (!this.isNonEmptyString(out.final.content)) {
+        issues.push('output.final.content 必须是非空字符串')
+      }
+    }
+
+    if (!Array.isArray(out.scores) || out.scores.length === 0) {
+      issues.push('output.scores 必须是非空数组')
+    } else {
+      for (const [index, score] of out.scores.entries()) {
+        if (!this.hasValidScoreRound(score)) {
+          issues.push(`output.scores[${index}] 结构不完整`)
+        }
+      }
+    }
+
+    if (out.final && out.title && out.final.title !== out.title) {
+      issues.push('output.final.title 必须与 output.title 完全一致')
+    }
+
+    if (out.final && out.body && out.final.content !== out.body) {
+      issues.push('output.final.content 必须与 output.body 完全一致')
+    }
+
+    if (out.outline && Array.isArray(out.outline.sections)) {
+      const outlineCount = out.outline.sections.length
+      if (Array.isArray(out.draft) && out.draft.length !== outlineCount) {
+        issues.push(`output.draft 章节数(${out.draft.length})必须与 output.outline.sections(${outlineCount})一致`)
+      }
+      if (Array.isArray(out.rewrite) && out.rewrite.length !== outlineCount) {
+        issues.push(`output.rewrite 章节数(${out.rewrite.length})必须与 output.outline.sections(${outlineCount})一致`)
+      }
+    }
+
+    const lastScore = Array.isArray(out.scores) ? out.scores.at(-1) : undefined
+    if (this.hasValidScoreRound(lastScore)) {
+      const { engagement, realism, emotion, value } = lastScore.metrics
+      if (engagement < 8 || realism < 8 || emotion < 8 || value < 8) {
+        issues.push(
+          `output.scores 最后一轮评分未达标：engagement=${engagement}, realism=${realism}, emotion=${emotion}, value=${value}`,
+        )
+      }
+    }
+
+    return issues
+  }
+
   private countChineseWords(text: string): number {
     const chineseChars = text.match(/[\u4e00-\u9fff\u3400-\u4dbf]/g)?.length ?? 0
-    const englishWords = text.match(/[a-zA-Z]+/g)?.length ?? 0
+    const englishWords = (text.match(/[a-zA-Z]+/g)?.length ?? 0) * 2
     const digitCount = text.match(/\d/g)?.length ?? 0
     return chineseChars + englishWords + Math.ceil(digitCount * 0.5)
   }
@@ -350,8 +518,8 @@ export class WriteExpert implements ExpertSkill {
 
     // 字数扣分
     const wordCount = this.countChineseWords(out.body ?? '')
-    if (wordCount < 1800) {
-      score -= (1800 - wordCount) * 0.003
+    if (wordCount < 2000) {
+      score -= (2000 - wordCount) * 0.003
     }
 
     // 空洞开场扣分

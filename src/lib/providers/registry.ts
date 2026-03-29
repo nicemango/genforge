@@ -2,6 +2,7 @@ import type { AIProvider } from './types'
 import { createAnthropicProvider } from './anthropic'
 import { createOpenAIProvider } from './openai'
 import type { ModelConfig } from '@/lib/config'
+import { recordUsage } from '@/lib/llm-usage'
 
 const AGENT_MODEL_DEFAULTS: Record<string, string> = {
   topic: 'claude-haiku-4-5-20251001',
@@ -35,7 +36,7 @@ function resolveAgentConfig(
   // Fall back to default provider
   const providerType = modelConfig.defaultProviderType ?? 'anthropic'
   const apiKey = modelConfig.apiKey ?? ''
-  const baseURL = providerType === 'openai' ? modelConfig.baseURL : undefined
+  const baseURL = modelConfig.baseURL
   const defaultModel =
     modelConfig.overrides?.[agentName] ??
     modelConfig.defaultModel ??
@@ -51,6 +52,7 @@ function resolveAgentConfig(
 export function createAgentProvider(agentName: string, modelConfig: ModelConfig): AIProvider {
   const { provider, model } = resolveAgentConfig(agentName, modelConfig)
 
+  const baseProvider: AIProvider = (() => {
   switch (provider.type) {
     case 'anthropic':
       return createAnthropicProvider(provider.apiKey, model, provider.baseURL)
@@ -61,5 +63,36 @@ export function createAgentProvider(agentName: string, modelConfig: ModelConfig)
       return createOpenAIProvider(provider.apiKey, model, provider.baseURL)
     default:
       throw new Error(`Unknown provider type: ${(provider as { type: string }).type}`)
+  }
+  })()
+
+  return {
+    ...baseProvider,
+    async chat(messages, options) {
+      const startedAt = Date.now()
+      const response = await baseProvider.chat(messages, options)
+      recordUsage({
+        agentName,
+        providerName: baseProvider.name,
+        model: options?.model ?? model,
+        usage: response.usage,
+        kind: "chat",
+        durationMs: Date.now() - startedAt,
+      })
+      return response
+    },
+    async chatWithTools(messages, tools, options) {
+      const startedAt = Date.now()
+      const response = await baseProvider.chatWithTools(messages, tools, options)
+      recordUsage({
+        agentName,
+        providerName: baseProvider.name,
+        model: options?.model ?? model,
+        usage: response.usage,
+        kind: "chatWithTools",
+        durationMs: Date.now() - startedAt,
+      })
+      return response
+    },
   }
 }

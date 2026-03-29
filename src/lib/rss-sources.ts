@@ -53,7 +53,10 @@ export const TOPICS: TopicConfig[] = [
     description: 'AI 模型、工具、项目更新、开发者社区热议',
     sourceCategories: [
       'cn_tech',    // 中文科技媒体
+      'cn_social',  // 知乎
+      'cn_wechat',  // 微信公众号
       'intl_dev',   // HN / Lobsters / Smashing
+      'intl_social', // Reddit
       'research',    // arXiv
       'intl_tech',  // TechCrunch / Verge / Wired
       'ai_project', // AI 公司博客
@@ -211,6 +214,13 @@ export const RSS_SOURCES: RssSource[] = [
     category: 'cn_tech',
   },
 
+  // ========== 知乎（直连 RSS） ==========
+  {
+    name: '知乎热榜',
+    url: 'https://www.zhihu.com/rss',
+    category: 'cn_social',
+  },
+
   // ========== 国际开发者社区（直连） ==========
   {
     name: 'Hacker News',
@@ -226,6 +236,23 @@ export const RSS_SOURCES: RssSource[] = [
     name: 'Lobsters',
     url: 'https://lobste.rs/rss',
     category: 'intl_dev',
+  },
+
+  // ========== Reddit（直连 RSS） ==========
+  {
+    name: 'Reddit r/MachineLearning',
+    url: 'https://www.reddit.com/r/MachineLearning.rss',
+    category: 'intl_social',
+  },
+  {
+    name: 'Reddit r/technology',
+    url: 'https://www.reddit.com/r/technology.rss',
+    category: 'intl_social',
+  },
+  {
+    name: 'Reddit r/artificial',
+    url: 'https://www.reddit.com/r/artificial.rss',
+    category: 'intl_social',
   },
 
   // ========== 学术研究（直连） ==========
@@ -336,6 +363,18 @@ export const RSS_SOURCES: RssSource[] = [
     url: 'https://www.smashingmagazine.com/feed/',
     category: 'intl_dev',
     needsProxy: true,
+  },
+
+  // ========== 微信公众号（via wechat2rss.xlab.app） ==========
+  {
+    name: '机器之心',
+    url: 'https://wechat2rss.xlab.app/feed/51e92aad2728acdd1fda7314be32b16639353001.xml',
+    category: 'cn_wechat',
+  },
+  {
+    name: '量子位',
+    url: 'https://wechat2rss.xlab.app/feed/7131b577c61365cb47e81000738c10d872685908.xml',
+    category: 'cn_wechat',
   },
 ]
 

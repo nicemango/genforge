@@ -3,7 +3,7 @@ import type { ModelConfig } from "@/lib/ai";
 import { getDefaultModelConfig, listConfiguredProviderModelConfigs } from "@/config/llm";
 import type { WritingStyle } from "@/agents/writer";
 import { runTrendAgent } from "@/agents/trend";
-import { runTopicAgent } from "@/agents/topic";
+import { inferPublishabilityTier, runTopicAgent, type PublishabilityTier } from "@/agents/topic";
 import { runResearchAgent } from "@/agents/research";
 import { runWriterAgent, WRITER_PROMPT_VERSION } from "@/agents/writer";
 import { runImageAgent } from "@/agents/image";
@@ -942,6 +942,10 @@ async function executeStep(
           console.log(`[FULL_PIPELINE] Processing topic ${topicId} (completed steps: ${completedStepsForTopic.join(", ") || "none"})`)
 
           try {
+            const topic = await prisma.topic.findUniqueOrThrow({
+              where: { id: topicId },
+            })
+
             // RESEARCH for this topic
             if (!completedStepsForTopic.includes("research")) {
               const researchResult = await runStepWithWorkspace("RESEARCH", { topicId }, "research", topicId)
@@ -955,6 +959,7 @@ async function executeStep(
             let lastReviewOutput: unknown = null
             let reviewFeedback: string | undefined = undefined
             let topicSucceeded = false
+            let autoPublishSkipped = false
 
             for (let attempt = 0; attempt <= maxRetries; attempt++) {
               console.log(`[FULL_PIPELINE] Topic ${topicId}: Attempt ${attempt + 1}/${maxRetries + 1}`)
@@ -1031,6 +1036,63 @@ async function executeStep(
                 // Quality gate passed for this topic
                 console.log(`[FULL_PIPELINE] Topic ${topicId} passed review (score: ${reviewData.score})`)
 
+                const autoPublishDecision = shouldAutoPublishTopic({
+                  topic: {
+                    title: topic.title,
+                    summary: topic.summary,
+                    sources: JSON.parse(topic.sources) as Array<{
+                      title: string;
+                      url: string;
+                      source: string;
+                    }>,
+                  },
+                  score: reviewData.score,
+                  minScore: qualityConfig.minScore,
+                  dimensionScores: reviewData.dimensionScores,
+                })
+
+                if (!autoPublishDecision.allowed) {
+                  const readyContent = await prisma.content.findFirst({
+                    where: {
+                      accountId: input.accountId,
+                      topicId,
+                      status: "READY",
+                    },
+                    orderBy: { createdAt: "desc" },
+                  })
+
+                  if (readyContent) {
+                    const existingNotes = parseAccountJsonField<Record<string, unknown>>(
+                      readyContent.reviewNotes,
+                      "content.reviewNotes",
+                      {},
+                    )
+                    await prisma.content.update({
+                      where: { id: readyContent.id },
+                      data: {
+                        reviewNotes: JSON.stringify({
+                          ...existingNotes,
+                          autoPublish: {
+                            allowed: false,
+                            tier: autoPublishDecision.tier,
+                            reason: autoPublishDecision.reason,
+                          },
+                        }),
+                      },
+                    })
+                  }
+
+                  failedTopics.push({
+                    topicId,
+                    error: `Auto-publish skipped (${autoPublishDecision.tier}): ${autoPublishDecision.reason}`,
+                  })
+                  autoPublishSkipped = true
+                  console.warn(
+                    `[FULL_PIPELINE] Topic ${topicId} kept in READY, auto-publish skipped (${autoPublishDecision.tier}): ${autoPublishDecision.reason}`,
+                  )
+                  break
+                }
+
                 // PUBLISH
                 const publishResult = await runStep({
                   ...input,
@@ -1079,7 +1141,7 @@ async function executeStep(
               }
             }
 
-            if (!topicSucceeded) {
+            if (!topicSucceeded && !autoPublishSkipped) {
               // All retries exhausted for this topic
               const finalReview = lastReviewOutput as { score: number; issues: string[] } | null
               failedTopics.push({
@@ -1237,6 +1299,53 @@ function buildReviewFeedback(
   }
 
   return sections.join("\n");
+}
+
+function shouldAutoPublishTopic(params: {
+  topic: {
+    title: string;
+    summary: string;
+    sources: Array<{ title: string; url: string; source: string }>;
+  };
+  score: number;
+  minScore: number;
+  dimensionScores?: DimensionScores;
+}): {
+  allowed: boolean;
+  tier: PublishabilityTier;
+  reason?: string;
+} {
+  const tier = inferPublishabilityTier(
+    params.topic.title,
+    params.topic.summary,
+    params.topic.sources,
+  );
+  const dataSupport = params.dimensionScores?.dataSupport ?? 0;
+
+  const threshold =
+    tier === "high-evidence"
+      ? { minScore: params.minScore, minDataSupport: 7 }
+      : tier === "policy-doc"
+        ? { minScore: Math.max(params.minScore, 8), minDataSupport: 8 }
+        : { minScore: Math.max(params.minScore + 0.5, 8.5), minDataSupport: 9 };
+
+  if (params.score < threshold.minScore) {
+    return {
+      allowed: false,
+      tier,
+      reason: `overall score ${params.score} below auto-publish threshold ${threshold.minScore}`,
+    };
+  }
+
+  if (dataSupport < threshold.minDataSupport) {
+    return {
+      allowed: false,
+      tier,
+      reason: `dataSupport ${dataSupport} below auto-publish threshold ${threshold.minDataSupport}`,
+    };
+  }
+
+  return { allowed: true, tier };
 }
 
 export async function runFullPipeline(

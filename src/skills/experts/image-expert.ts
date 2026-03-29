@@ -16,6 +16,8 @@ interface ImagePlaceholder {
 interface ImageAgentOutput {
   imagePlaceholders?: ImagePlaceholder[]
   images?: Array<{ base64?: string; dataUrl?: string; width?: number; height?: number }>
+  assets?: Array<{ imageBase64?: string; url?: string; width?: number; height?: number }>
+  imagePlan?: { cover?: unknown; items?: unknown[] }
   [key: string]: unknown
 }
 
@@ -28,6 +30,7 @@ interface ImageAgentInput {
 function isValidBase64(str: string): boolean {
   if (!str || typeof str !== 'string') return false
   if (str.startsWith('data:image')) return true
+  if (str.startsWith('http://') || str.startsWith('https://')) return true
   // Check if it's valid base64 (alphanumeric + +/=)
   return /^[A-Za-z0-9+/=]{20,}$/.test(str)
 }
@@ -81,10 +84,10 @@ export const imageExpert: ExpertSkill = {
     if (!inp.body || typeof inp.body !== 'string') {
       issues.push('缺少 articleTitle 或 body 字段，或类型错误')
     } else {
-      // Check for cover placeholders
-      const placeholderCount = (inp.body.match(/!\[[^\]]*\]\(cover\)/g) ?? []).length
+      // Check for image placeholders
+      const placeholderCount = (inp.body.match(/!\[[^\]]*\]\(image:(?:cover|section-\d+)\)/g) ?? []).length
       if (placeholderCount === 0) {
-        warnings.push('文章中未发现图片占位符 [](cover)，可能不需要生成图片')
+        warnings.push('文章中未发现图片占位符（image:cover / image:section-N），可能不需要生成图片')
       } else if (placeholderCount < 2) {
         warnings.push(`文章中仅有 ${placeholderCount} 个图片占位符，数量偏少`)
       }
@@ -113,16 +116,18 @@ export const imageExpert: ExpertSkill = {
     const placeholders = out.imagePlaceholders
     const images = out.images
 
-    if (!placeholders && !images) {
+    const assets = out.assets
+
+    if (!placeholders && !images && !assets) {
       return {
         valid: false,
-        issues: ['输出缺少 imagePlaceholders 或 images 字段'],
+        issues: ['输出缺少 imagePlaceholders、images 或 assets 字段'],
       }
     }
 
-    const imgArray = placeholders ?? images ?? []
+    const imgArray = placeholders ?? images ?? assets ?? []
     if (!Array.isArray(imgArray)) {
-      return { valid: false, issues: ['imagePlaceholders/images 必须是数组'] }
+      return { valid: false, issues: ['imagePlaceholders/images/assets 必须是数组'] }
     }
 
     if (imgArray.length === 0) {
@@ -131,7 +136,7 @@ export const imageExpert: ExpertSkill = {
 
     // Check count matches placeholders in input
     const inputPlaceholders =
-      inp?.body ? (inp.body.match(/!\[[^\]]*\]\(cover\)/g) ?? []).length : 0
+      inp?.body ? (inp.body.match(/!\[[^\]]*\]\(image:(?:cover|section-\d+)\)/g) ?? []).length : 0
     if (inputPlaceholders > 0) {
       const diff = imgArray.length - inputPlaceholders
       if (Math.abs(diff) > 1) {
@@ -152,10 +157,11 @@ export const imageExpert: ExpertSkill = {
           ? img
           : (img.imageBase64 as string | undefined) ??
             (img.base64 as string | undefined) ??
-            (img.dataUrl as string | undefined)
+            (img.dataUrl as string | undefined) ??
+            (img.url as string | undefined)
 
       if (!base64) {
-        issues.push(`图片[${i}]缺少 base64 数据`)
+        issues.push(`图片[${i}]缺少可用图片数据`)
         continue
       }
 
@@ -178,6 +184,15 @@ export const imageExpert: ExpertSkill = {
 
     if (validImageCount === 0 && imgArray.length > 0) {
       issues.push('所有图片的 base64 数据均无效')
+    }
+
+    if (out.imagePlan && typeof out.imagePlan === 'object') {
+      const itemCount =
+        ((Array.isArray(out.imagePlan.items) ? out.imagePlan.items.length : 0) +
+          (out.imagePlan.cover ? 1 : 0))
+      if (imgArray.length > 0 && itemCount === 0) {
+        warnings.push('生成了素材但 imagePlan 为空，后续排查会比较困难')
+      }
     }
 
     // Score: base on coverage and quality
@@ -217,7 +232,7 @@ export const imageExpert: ExpertSkill = {
 
     const recommendations: string[] = []
     const out = output as ImageAgentOutput
-    const imgCount = (out.imagePlaceholders ?? out.images ?? []).length
+    const imgCount = (out.imagePlaceholders ?? out.images ?? out.assets ?? []).length
 
     if (imgCount === 0) {
       recommendations.push('未生成任何图片，建议检查 generate_image 工具调用是否成功')
